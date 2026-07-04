@@ -1,0 +1,36 @@
+[Unit]
+Description=ringdown-webui — admin live view (Entra SSO, read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ringdown
+Group=ringdown
+WorkingDirectory=/opt/ringdown
+ExecStart=/opt/ringdown/.venv/bin/python -m ringdown.webui
+Restart=always
+RestartSec=3
+# Fast, clean restarts: uvicorn drains long-lived SSE clients on SIGTERM and would
+# otherwise hang to the 90s default. Cap at 5s, then SIGKILL, and treat the signal
+# exit as a clean stop (not "Failed").
+TimeoutStopSec=5
+SuccessExitStatus=143 137
+
+# --- sandbox (read-only service: reads Postgres + the OIDC key, writes nothing) ---
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# no ReadWritePaths — the WebUI never writes to disk
+
+[Install]
+WantedBy=multi-user.target

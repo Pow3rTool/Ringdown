@@ -1,0 +1,22 @@
+[project]
+name = "ringdown"
+version = "0.1.0"
+description = "Ingest logs, decide what matters, ring the right responder — human or agent."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "psycopg[binary,pool]>=3.2",
+    "mcp>=1.2",              # FastMCP control plane
+    "pyjwt[crypto]>=2.8",   # Entra bearer validation (JWKS/RS256)
+    "uvicorn>=0.30",        # ASGI host for the MCP
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["ringdown*"]

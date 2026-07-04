@@ -1,0 +1,29 @@
+# SECRETS / local state — MUST never enter the image (mounted at runtime instead)
+.env
+*.env
+*.env.*
+.env.bak.*
+oidc/
+etc/
+var/
+*.log
+
+# host-only / build cruft
+.git/
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+ringdown.bak-*
+*.bak
+*.swp
+
+# not needed in the runtime image
+deploy/
+scripts/
+tests/
+docs/
+*.md
+!README.md

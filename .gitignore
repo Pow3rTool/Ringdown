@@ -1,0 +1,25 @@
+# secrets & local state — never commit
+.env
+*.env
+var/
+*.log
+
+# per-host nginxrocks site config (nginx.conf + certbot.pem) lives alongside the
+# app in /opt/ringdown/etc on the deploy box — host-specific, never in git
+etc/
+
+# editor swap/backup files
+*.swp
+*.swo
+*~
+*.bak
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

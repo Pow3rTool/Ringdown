@@ -99,6 +99,47 @@ def _regex_safe(pattern: str) -> str | None:
             return f"repetition {{{m.group(1)},{m.group(2) or ''}}} is too large (> 1000)."
     return None
 
+
+# --- source_glob sanity: reject rules that can NEVER match --------------------
+# source_glob is ONE fnmatch pattern tested against a single source host per event
+# (the router does `fnmatch(event.source, glob)`) — it is NOT a list. A comma-joined
+# value like "database,mcp,aipi" is a silent dud: fnmatch treats the commas as
+# literals, matches no real host, and the rule never fires. That exact mistake has
+# shipped and generated "why doesn't my rule work / why am I still paged" reports,
+# so we reject it at write time with a concrete fix instead of storing dead data.
+def _glob_check(glob: str) -> str | None:
+    g = (glob or "").strip()
+    if not g:
+        return None  # empty = match every source (valid, intentional)
+    if "," in g:
+        return (f"source_glob is a single host pattern, not a comma list — the collector does one "
+                f"fnmatch(source, glob) per line, so {g!r} matches NOTHING and the rule would never "
+                f"fire. Fix: create ONE rule per host (glob='database', another glob='mcp', …), use a "
+                f"wildcard (glob='rtr*'), or leave source_glob empty to match every source.")
+    if any(ch.isspace() for ch in g):
+        return (f"source_glob {g!r} contains whitespace, but source host names have none — it would "
+                f"match nothing. Remove the spaces (and don't comma/space-join multiple hosts).")
+    return None
+
+
+async def _glob_source_warn(glob: str) -> str | None:
+    """Soft warning (NOT a reject): a wildcard-free glob that matches no known source
+    is probably a typo. We don't fail — the host may simply not have logged yet — but
+    we tell the author, with near matches, so the LLM can self-correct a dead rule."""
+    import difflib
+    g = (glob or "").strip()
+    if not g or any(c in g for c in "*?["):
+        return None  # empty or wildcard — can't cheaply assert it's wrong
+    rows = await _fetch("SELECT source FROM sources WHERE active ORDER BY last_seen DESC LIMIT 500", ())
+    known = [r["source"] for r in rows]
+    if g in known:
+        return None
+    near = difflib.get_close_matches(g, known, n=3, cutoff=0.5)
+    hint = f" Did you mean: {', '.join(near)}?" if near else ""
+    return (f"source_glob {g!r} matches no currently-known source host.{hint} If that host just "
+            f"hasn't logged yet, this is fine; otherwise the rule will never match anything.")
+
+
 _GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 Ident = namedtuple("Ident", "oid upn appid roles")
 _pool: AsyncConnectionPool | None = None
@@ -613,6 +654,10 @@ async def register_alert(ctx: Context, name: str, kind: str, pattern: str, instr
         unsafe = _regex_safe(pattern)
         if unsafe:
             return _err(unsafe)
+    gerr = _glob_check(source_glob)
+    if gerr:
+        await _audit(ident, "register_alert", {"name": name, "rejected": "bad source_glob"}, False)
+        return _err(gerr)
     tids = []
     for t in (targets or "").split(","):
         t = t.strip()
@@ -643,7 +688,14 @@ async def register_alert(ctx: Context, name: str, kind: str, pattern: str, instr
         await _exec("INSERT INTO rule_targets (rule_id, target_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                     (row["id"], tid))
     await _audit(ident, "register_alert", {"id": row["id"], "name": name, "kind": kind, "targets": tids}, True)
-    return _out({"registered": True, "id": row["id"], "name": name, "kind": kind, "bound_targets": tids})
+    result = {"registered": True, "id": row["id"], "name": name, "kind": kind, "bound_targets": tids}
+    warn = await _glob_source_warn(source_glob)
+    if warn:
+        result["warning"] = warn
+    if not tids:
+        result["note"] = ("rule has no targets: it fires nowhere UNLESS stop_on_match=true, in which "
+                          "case it is a silent allowlist block (matches, stops the router, notifies nobody).")
+    return _out(result)
 
 
 async def _load_rule_owner(rule_id: int):
@@ -688,6 +740,9 @@ async def update_alert(ctx: Context, rule_id: int, pattern: str = "", instructio
     if instructions:
         sets.append("instructions = %s"); params.append(instructions)
     if source_glob:
+        gerr = _glob_check(source_glob)
+        if gerr:
+            return _err(gerr)
         sets.append("source_glob = %s"); params.append(source_glob)
     if min_severity >= 0:
         sets.append("min_severity = %s"); params.append(int(min_severity) or None)

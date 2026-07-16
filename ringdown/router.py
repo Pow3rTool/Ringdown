@@ -48,12 +48,16 @@ class Router:
                 continue
             if not rule["rx"].search(target_field):
                 continue
-            ctx = self._build_ctx(rule, ev)
-            for target in rule["targets"]:
-                if target["id"] in dispatched_targets:
-                    continue  # coalesced — another matched rule already fired this target
-                dispatched_targets.add(target["id"])
-                self._spawn(self._coord.handle(ctx, target))
+            if rule["targets"]:
+                ctx = self._build_ctx(rule, ev)
+                for target in rule["targets"]:
+                    if target["id"] in dispatched_targets:
+                        continue  # coalesced — another matched rule already fired this target
+                    dispatched_targets.add(target["id"])
+                    self._spawn(self._coord.handle(ctx, target))
+            # A matched rule with NO targets is a SILENT BLOCK (an allowlist entry): it
+            # notifies nobody but still honors stop_on_match, shortcutting the router past
+            # lower-priority rules (e.g. a catch-all pager). Zero-notification suppression.
             if rule["stop_on_match"]:
                 break
 

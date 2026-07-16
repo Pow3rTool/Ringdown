@@ -51,8 +51,12 @@ class Ruleset:
             except re.error:
                 continue  # a bad regex is skipped, not fatal (MCP validates on write)
             targets = by_rule.get(r["id"], [])
-            if not targets:
-                continue  # an unbound rule can't fire anywhere — skip it
+            if not targets and not r["stop_on_match"]:
+                continue  # unbound AND not terminal — it can neither dispatch nor block; skip.
+                # An unbound rule WITH stop_on_match is a *silent block* (an allowlist entry):
+                # it matches, shortcuts the router past lower-priority rules (e.g. a catch-all
+                # pager), and dispatches to nobody — suppression that costs zero notifications.
+                # See router._consider_one, which honors stop_on_match even with no targets.
             compiled.append({
                 "id": r["id"], "name": r["name"], "rx": rx,
                 "instructions": r["instructions"], "glob": r["source_glob"],

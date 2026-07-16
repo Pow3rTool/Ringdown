@@ -92,3 +92,20 @@ async def test_stop_on_match_halts_lower_rules():
     rules = [_rule(1, "flap", [10], order=1, stop=True), _rule(2, "flap", [11], order=2)]
     got = await _run(rules, _event("flap"))
     assert got == [(1, 10)]                     # rule2 never evaluated
+
+
+async def test_silent_block_stops_without_dispatch():
+    # An unbound stop_on_match rule is an allowlist "block quick": it matches, halts
+    # lower-priority rules, and dispatches to NOBODY (zero-notification suppression).
+    rules = [_rule(1, "allow", [], order=1, stop=True), _rule(2, "allow", [11], order=2)]
+    got = await _run(rules, _event("allow this"))
+    assert got == []                            # rule1 blocked silently; rule2 never evaluated
+
+
+async def test_unbound_nonstop_rule_is_noop_not_terminal():
+    # An unbound rule WITHOUT stop_on_match dispatches nothing but does NOT halt the
+    # router; a lower-priority bound rule still fires. (The ruleset compiler drops such
+    # a rule entirely; the router must also neither crash nor block on it.)
+    rules = [_rule(1, "allow", [], order=1, stop=False), _rule(2, "allow", [11], order=2)]
+    got = await _run(rules, _event("allow this"))
+    assert got == [(2, 11)]

@@ -178,7 +178,8 @@ async def main() -> None:
                            token_scopes=config.OBO_SCOPES, http=http)
     registry = build_registry(
         http, admin=admin, turnstone_url=config.TURNSTONE_URL,
-        default_owner=config.TURNSTONE_DEFAULT_OWNER, ntfy_url=config.NTFY_URL,
+        default_owner=config.TURNSTONE_DEFAULT_OWNER,
+        default_project=config.TURNSTONE_DEFAULT_PROJECT, ntfy_url=config.NTFY_URL,
         ntfy_token=config.NTFY_TOKEN, ntfy_topic=config.NTFY_TOPIC,
         ntfy_allowed_hosts=config.NTFY_ALLOWED_HOSTS)
 

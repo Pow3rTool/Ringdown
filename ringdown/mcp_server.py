@@ -499,11 +499,12 @@ async def register_target(ctx: Context, name: str, type: str, config_json: str =
                           if the collector has defaults). turnstone: {"auto_approve_tools": "notify",
                           "skill": "...", "model": "..."} — all optional; DO NOT blanket auto_approve.
       • identity_policy — 'run-as-owner' (turnstone OBO), 'static-svc', or 'none' (ntfy).
-      • project_id      — REQUIRED for 'turnstone' targets: the turnstone project new chats are filed
-                          under (a rule's own project_id overrides this default). The deployment refuses
-                          projectless chat creation (server.require_project); a turnstone target with no
-                          project would always fall back to ntfy. The run-as OWNER must be a member of
-                          the project or turnstone drops it at dispatch. Get ids from turnstone
+      • project_id      — the turnstone project chats from this target are filed under. Precedence:
+                          a rule's own project_id > this target's > the deployment default
+                          (RINGDOWN_TURNSTONE_DEFAULT_PROJECT). Required ONLY if no deployment default is
+                          set (server.require_project refuses projectless creates, so a projectless
+                          turnstone target with no default would always fall back to ntfy). The run-as
+                          OWNER must be a member or turnstone drops it at dispatch. Ids: turnstone
                           GET /v1/api/projects. Ignored for ntfy targets.
       • project_name    — optional display label for the project (cosmetic; not authoritative).
     You own the target; only you (or an operator) can change/delete it, and only you can bind it."""
@@ -518,9 +519,11 @@ async def register_target(ctx: Context, name: str, type: str, config_json: str =
         return _err(f"unsupported target type {type!r}; supported: {sorted(KNOWN_TARGET_TYPES)}")
     if identity_policy not in IDENTITY_POLICIES:
         return _err(f"identity_policy must be one of {sorted(IDENTITY_POLICIES)}")
-    if type == "turnstone" and not (project_id or "").strip():
-        return _err("turnstone targets require project_id — new chats must be filed under a project "
-                    "(server.require_project refuses projectless creates). Pass the project_id the "
+    if (type == "turnstone" and not (project_id or "").strip()
+            and not (config.TURNSTONE_DEFAULT_PROJECT or "").strip()):
+        return _err("turnstone targets need a project — new chats must be filed under one "
+                    "(server.require_project refuses projectless creates) and no deployment-wide "
+                    "default (RINGDOWN_TURNSTONE_DEFAULT_PROJECT) is configured. Pass a project_id the "
                     "run-as owner is a member of; list ids from turnstone GET /v1/api/projects.")
     try:
         cfg = json.loads(config_json or "{}")
@@ -651,7 +654,11 @@ async def register_alert(ctx: Context, name: str, kind: str, pattern: str, instr
       • source_glob     — restrict to devices ('rtr*'); min_severity — OTel floor (>=).
       • window_kind/window_seconds/spike_lines — L2 windowing (sliding|tumbling).
       • rule_order/stop_on_match — router order (lower first) + terminal-stop (pf `quick`).
-      • project_id      — turnstone project for team visibility (carried for run-as-owner dispatch).
+      • project_id      — turnstone project this alert's chats are filed under. OPTIONAL: leave empty and
+                          it inherits the target's project, else the deployment default
+                          (RINGDOWN_TURNSTONE_DEFAULT_PROJECT). Set it only to override. You (the caller)
+                          automatically OWN the rule and it runs AS you — you must be a member of whatever
+                          project ends up effective, or turnstone drops it and the alert falls back to ntfy.
       • targets         — CSV of target ids to bind now (must be targets YOU own). Bind more later
                           with bind_target. A rule with NO targets never fires anywhere.
     The hook is owned by you (human+agent) and runs AS you (run-as-owner) when it fires."""

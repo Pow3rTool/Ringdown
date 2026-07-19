@@ -31,11 +31,12 @@ class TurnstoneDispatcher(Dispatcher):
     stateful = True
 
     def __init__(self, http, admin: TurnstoneAdmin, *, base_url: str,
-                 default_owner: str = ""):
+                 default_owner: str = "", default_project: str = ""):
         self._http = http
         self._admin = admin
         self._base = base_url.rstrip("/")
         self._default_owner = default_owner
+        self._default_project = default_project
 
     async def _owner(self, ctx: FireContext) -> str:
         """Resolve the run-as identity: the rule's stored owner_user, else the
@@ -72,14 +73,16 @@ class TurnstoneDispatcher(Dispatcher):
             body["skill"] = str(cfg["skill"])
         if cfg.get("model"):
             body["model"] = str(cfg["model"])
-        # Project attach: the rule's own project_id wins, else the turnstone
-        # target's default project. Turnstone re-validates that the run-as OWNER
-        # is a member (ensure_project_attachable) and silently drops the id
-        # otherwise — a projectless create is then refused under
-        # server.require_project and we fall back to ntfy. So a mis-assigned
-        # project degrades to a push; it never lands a chat in the wrong tenant.
+        # Project attach, most-specific wins: the rule's own project_id, else the
+        # target's, else the deployment-wide default (config.TURNSTONE_DEFAULT_PROJECT).
+        # Turnstone re-validates that the run-as OWNER is a member
+        # (ensure_project_attachable) and silently drops the id otherwise — a
+        # projectless create is then refused under server.require_project and we
+        # fall back to ntfy. So a mis-assigned project degrades to a push; it
+        # never lands a chat in the wrong tenant.
         project_id = (str(ctx.rule.get("project_id") or "").strip()
-                      or str(target.get("project_id") or "").strip())
+                      or str(target.get("project_id") or "").strip()
+                      or str(self._default_project or "").strip())
         if project_id:
             body["project_id"] = project_id
         try:

@@ -88,6 +88,12 @@ GLOBAL_RATE_CEILING = _i("RINGDOWN_GLOBAL_RATE_CEILING", 120)  # max dispatches/
 TURNSTONE_URL = _s("RINGDOWN_TURNSTONE_URL", "http://127.0.0.1:8090").rstrip("/")
 TURNSTONE_ADMIN_TOKEN = _s("RINGDOWN_TURNSTONE_ADMIN_TOKEN")   # mints per-user (owner) tokens
 TURNSTONE_DEFAULT_OWNER = _s("RINGDOWN_TURNSTONE_DEFAULT_OWNER")  # fallback owner user_id
+# Deployment-wide default turnstone project: new chats are filed under this when
+# neither the rule nor its target names one. server.require_project refuses
+# projectless creates, so with this set no alert can dispatch projectless; leave
+# it (and per-rule/target project) empty and turnstone dispatch degrades to ntfy.
+# The run-as owner must be a member of the project or turnstone drops it.
+TURNSTONE_DEFAULT_PROJECT = _s("RINGDOWN_TURNSTONE_DEFAULT_PROJECT")
 TOKEN_TTL_HOURS = _f("RINGDOWN_TURNSTONE_TOKEN_TTL_HOURS", 20)    # cache minted tokens this long
 # Scopes on the minted per-owner run-as token. Default excludes "approve" on
 # purpose (least-privilege): the design routes destructive remediation through the

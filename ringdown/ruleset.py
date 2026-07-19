@@ -34,7 +34,7 @@ class Ruleset:
         # target bindings for all rules in one query
         binds = await db.fetch(self._pool,
             "SELECT rt.rule_id, rt.target_order, rt.stop_on_match AS bind_stop, "
-            "t.id, t.name, t.type, t.config, t.identity_policy, t.owner_oid "
+            "t.id, t.name, t.type, t.config, t.identity_policy, t.owner_oid, t.project_id "
             "FROM rule_targets rt JOIN targets t ON t.id = rt.target_id "
             "ORDER BY rt.target_order, t.id")
         by_rule: dict = {}
@@ -42,6 +42,7 @@ class Ruleset:
             by_rule.setdefault(b["rule_id"], []).append({
                 "id": b["id"], "name": b["name"], "type": b["type"], "config": b["config"],
                 "identity_policy": b["identity_policy"], "owner_oid": b["owner_oid"],
+                "project_id": b["project_id"],
                 "target_order": b["target_order"], "bind_stop": b["bind_stop"],
             })
         compiled = []

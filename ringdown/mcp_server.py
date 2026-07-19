@@ -489,7 +489,8 @@ async def set_source_active(ctx: Context, source: str, active: bool = False) -> 
 # === target CRUD =============================================================
 @mcp.tool()
 async def register_target(ctx: Context, name: str, type: str, config_json: str = "{}",
-                          identity_policy: str = "none") -> str:
+                          identity_policy: str = "none", project_id: str = "",
+                          project_name: str = "") -> str:
     """Register a notification TARGET (how an alert reaches a responder). Needs Ringdown.Write.
       • name            — unique handle.
       • type            — 'ntfy' (public human push) or 'turnstone' (summon an agent, run-as-owner).
@@ -498,6 +499,13 @@ async def register_target(ctx: Context, name: str, type: str, config_json: str =
                           if the collector has defaults). turnstone: {"auto_approve_tools": "notify",
                           "skill": "...", "model": "..."} — all optional; DO NOT blanket auto_approve.
       • identity_policy — 'run-as-owner' (turnstone OBO), 'static-svc', or 'none' (ntfy).
+      • project_id      — REQUIRED for 'turnstone' targets: the turnstone project new chats are filed
+                          under (a rule's own project_id overrides this default). The deployment refuses
+                          projectless chat creation (server.require_project); a turnstone target with no
+                          project would always fall back to ntfy. The run-as OWNER must be a member of
+                          the project or turnstone drops it at dispatch. Get ids from turnstone
+                          GET /v1/api/projects. Ignored for ntfy targets.
+      • project_name    — optional display label for the project (cosmetic; not authoritative).
     You own the target; only you (or an operator) can change/delete it, and only you can bind it."""
     ident = _auth(ctx)
     if ident is None:
@@ -510,6 +518,10 @@ async def register_target(ctx: Context, name: str, type: str, config_json: str =
         return _err(f"unsupported target type {type!r}; supported: {sorted(KNOWN_TARGET_TYPES)}")
     if identity_policy not in IDENTITY_POLICIES:
         return _err(f"identity_policy must be one of {sorted(IDENTITY_POLICIES)}")
+    if type == "turnstone" and not (project_id or "").strip():
+        return _err("turnstone targets require project_id — new chats must be filed under a project "
+                    "(server.require_project refuses projectless creates). Pass the project_id the "
+                    "run-as owner is a member of; list ids from turnstone GET /v1/api/projects.")
     try:
         cfg = json.loads(config_json or "{}")
         if not isinstance(cfg, dict):
@@ -522,13 +534,16 @@ async def register_target(ctx: Context, name: str, type: str, config_json: str =
         return _err(cfg_err)
     try:
         row = await _exec(
-            "INSERT INTO targets (name, type, config, identity_policy, owner_oid, owner_upn, owner_bot) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (name, type, Jsonb(cfg), identity_policy, ident.oid, ident.upn, ident.appid))
+            "INSERT INTO targets (name, type, config, identity_policy, owner_oid, owner_upn, owner_bot, "
+            "project_id, project_name) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (name, type, Jsonb(cfg), identity_policy, ident.oid, ident.upn, ident.appid,
+             (project_id or "").strip() or None, (project_name or "").strip() or None))
     except Exception as e:
         return _err(f"insert failed (name unique?): {type(e).__name__}: {str(e)[:200]}")
-    await _audit(ident, "register_target", {"id": row["id"], "name": name, "type": type}, True)
-    return _out({"registered": True, "id": row["id"], "name": name, "type": type})
+    await _audit(ident, "register_target",
+                 {"id": row["id"], "name": name, "type": type, "project_id": (project_id or "").strip()}, True)
+    return _out({"registered": True, "id": row["id"], "name": name, "type": type,
+                 "project_id": (project_id or "").strip() or None})
 
 
 @mcp.tool()
@@ -542,21 +557,24 @@ async def list_targets(ctx: Context) -> str:
     if not ok:
         return _err(why)
     rows = await _fetch("SELECT id, name, type, config, identity_policy, owner_oid, owner_upn, "
-                        "owner_bot, created_at FROM targets ORDER BY id", [])
+                        "owner_bot, project_id, project_name, created_at FROM targets ORDER BY id", [])
     op = _is_admin(ident)
     out = []
     for r in rows:
         visible = op or _owns(ident, r["owner_oid"], r["owner_bot"])
-        out.append({**{k: r[k] for k in ("id", "name", "type", "identity_policy", "owner_upn", "created_at")},
+        out.append({**{k: r[k] for k in ("id", "name", "type", "identity_policy", "owner_upn",
+                                          "project_id", "project_name", "created_at")},
                     "config": r["config"] if visible else "<redacted — not owner>"})
     return _out({"count": len(out), "targets": out})
 
 
 @mcp.tool()
 async def update_target(ctx: Context, target_id: int, config_json: str = "", identity_policy: str = "",
-                        name: str = "") -> str:
-    """Update a target's config/identity_policy/name (owner or operator only). Only non-empty
-    fields change. config_json REPLACES the whole config object."""
+                        name: str = "", project_id: str = "", project_name: str = "") -> str:
+    """Update a target's config/identity_policy/name/project (owner or operator only). Only non-empty
+    fields change. config_json REPLACES the whole config object. project_id sets the turnstone project
+    a turnstone target files chats under (see register_target); it cannot be blanked here (pass a new
+    id to move it)."""
     ident = _auth(ctx)
     if ident is None:
         return _err("unauthenticated: bearer failed validation")
@@ -588,8 +606,12 @@ async def update_target(ctx: Context, target_id: int, config_json: str = "", ide
         sets.append("identity_policy = %s"); params.append(identity_policy)
     if name:
         sets.append("name = %s"); params.append(name)
+    if project_id:
+        sets.append("project_id = %s"); params.append(project_id.strip())
+    if project_name:
+        sets.append("project_name = %s"); params.append(project_name.strip())
     if not sets:
-        return _err("nothing to update (set config_json/identity_policy/name).")
+        return _err("nothing to update (set config_json/identity_policy/name/project_id/project_name).")
     params.append(int(target_id))
     upd = await _exec(f"UPDATE targets SET {', '.join(sets)} WHERE id = %s RETURNING id, name", params)
     await _audit(ident, "update_target", {"target_id": target_id, "fields": len(sets)}, True)

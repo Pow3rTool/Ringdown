@@ -72,9 +72,16 @@ class TurnstoneDispatcher(Dispatcher):
             body["skill"] = str(cfg["skill"])
         if cfg.get("model"):
             body["model"] = str(cfg["model"])
-        # NOTE: project attach is intentionally NOT sent — Turnstone's create
-        # route does not yet accept project_id. rule.project_id
-        # is carried for when that route lands.
+        # Project attach: the rule's own project_id wins, else the turnstone
+        # target's default project. Turnstone re-validates that the run-as OWNER
+        # is a member (ensure_project_attachable) and silently drops the id
+        # otherwise — a projectless create is then refused under
+        # server.require_project and we fall back to ntfy. So a mis-assigned
+        # project degrades to a push; it never lands a chat in the wrong tenant.
+        project_id = (str(ctx.rule.get("project_id") or "").strip()
+                      or str(target.get("project_id") or "").strip())
+        if project_id:
+            body["project_id"] = project_id
         try:
             r = await self._http.post(
                 f"{self._base}/v1/api/route/workstreams/new?ws_id={ws_id}",
@@ -84,7 +91,7 @@ class TurnstoneDispatcher(Dispatcher):
             return DispatchResult(ok=False, detail=f"create failed: {type(e).__name__}: {str(e)[:160]}")
         ws_id = (r.json() or {}).get("ws_id", ws_id) or ws_id
         return DispatchResult(ok=True, handle=ws_id, detail=f"opened ws {ws_id} as {owner}",
-                              meta={"project_id": ctx.rule.get("project_id") or ""})
+                              meta={"project_id": project_id})
 
     async def feed(self, ctx: FireContext, target: dict, handle: str) -> DispatchResult:
         owner = await self._owner(ctx)

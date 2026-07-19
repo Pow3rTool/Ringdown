@@ -159,9 +159,19 @@ CREATE TABLE IF NOT EXISTS targets (
     owner_oid       text,                                 -- Entra oid of the target's owner (human)
     owner_upn       text,
     owner_bot       text,                                 -- azp/appid of the registering agent (bot)
+    project_id      text,                                 -- turnstone project a 'turnstone' target files chats under
+                                                          -- (the default; a rule's own project_id overrides it).
+                                                          -- REQUIRED for turnstone targets when the deployment runs
+                                                          -- with server.require_project on, else dispatch fails closed.
+    project_name    text,                                 -- display-only cache of the project's name (not authoritative)
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS targets_name ON targets (name);
+
+-- migration for existing installs (targets predate turnstone project assignment;
+-- see server.require_project — a projectless turnstone create is refused + falls back to ntfy)
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS project_id   text;
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS project_name text;
 
 -- --- alert hooks: regex (L1) or semantic/plain-English (L2) ---------------
 CREATE TABLE IF NOT EXISTS alert_rules (

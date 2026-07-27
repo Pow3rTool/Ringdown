@@ -12,7 +12,7 @@
 --     + L2 window semantics (window_kind, spike_lines).
 --   * A dedup `alert_incidents` envelope keyed per (rule, target, source) so
 --     fan-out to N targets keeps N independent stateful handles.
---   * An `audit` table for every rule/target CRUD + every dispatch.
+--   * An `audit` table for filter/rule/target CRUD + every dispatch.
 --   * LISTEN/NOTIFY triggers so the collector refreshes its in-memory ruleset
 --     on change instead of polling the DB per line.
 --
@@ -47,6 +47,14 @@ CREATE INDEX IF NOT EXISTS events_src_ts    ON events (source, ts DESC);
 CREATE INDEX IF NOT EXISTS events_search    ON events USING gin (search);
 CREATE INDEX IF NOT EXISTS events_sev_ts    ON events (severity, ts DESC);
 CREATE INDEX IF NOT EXISTS events_tmpl      ON events (template_id);
+
+-- Applied-data migrations are recorded separately from idempotent DDL.  This
+-- prevents an operator-deleted seed filter from being resurrected whenever the
+-- schema is re-applied during a later deployment.
+CREATE TABLE IF NOT EXISTS ringdown_schema_migrations (
+    version    text        PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
 
 -- Idempotently create the weekly partition covering `at` (ISO week, Mon..Mon).
 CREATE OR REPLACE FUNCTION ringdown_ensure_week(at timestamptz)
@@ -93,6 +101,90 @@ CREATE TABLE IF NOT EXISTS sources (
 );
 -- migration for existing installs (the Ringdown prototype's table had no `active`)
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT true;
+
+-- --- ingress filters: discard routine noise before it touches the event spine
+-- Global operator policy, hot-loaded by the collector through filters_changed.
+-- The first matching enabled row wins, both for predictable stats attribution
+-- and so the hot path never evaluates unnecessary lower-priority expressions.
+CREATE TABLE IF NOT EXISTS ingress_filters (
+    id             bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name           text        NOT NULL
+                               CHECK (char_length(btrim(name)) BETWEEN 1 AND 120),
+    match_type     text        NOT NULL CHECK (match_type IN ('substring', 'regex')),
+    pattern        text        NOT NULL
+                               CHECK (char_length(btrim(pattern)) BETWEEN 1 AND 512),
+    source_glob    text        CHECK (source_glob IS NULL OR
+                               (char_length(source_glob) BETWEEN 1 AND 255 AND
+                                source_glob !~ '[,[:space:]\[\]]')), -- optional *,? host scope
+    program_glob   text        CHECK (program_glob IS NULL OR
+                               (char_length(program_glob) BETWEEN 1 AND 255 AND
+                                program_glob !~ '[,[:space:]\[\]]')), -- optional *,? app scope
+    case_sensitive boolean     NOT NULL DEFAULT false,
+    filter_order   integer     NOT NULL DEFAULT 100 CHECK (filter_order BETWEEN 0 AND 1000000),
+    enabled        boolean     NOT NULL DEFAULT true,
+    created_by     text,                              -- Entra oid, or 'system' for seed rows
+    created_by_upn text,
+    created_by_bot text,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ingress_filters_name ON ingress_filters (name);
+CREATE INDEX IF NOT EXISTS ingress_filters_enabled
+    ON ingress_filters (enabled, filter_order, id);
+
+-- Drop counters live separately so their per-batch upserts never trigger a
+-- filter-set reload.  Bodies are intentionally not retained.
+CREATE TABLE IF NOT EXISTS ingress_filter_stats (
+    filter_id    bigint      NOT NULL REFERENCES ingress_filters(id) ON DELETE CASCADE,
+    source       text        NOT NULL,
+    matched      bigint      NOT NULL DEFAULT 0,
+    last_matched timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (filter_id, source)
+);
+CREATE INDEX IF NOT EXISTS ingress_filter_stats_last
+    ON ingress_filter_stats (last_matched DESC);
+
+CREATE OR REPLACE FUNCTION ringdown_touch_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_touch_ingress_filter ON ingress_filters;
+CREATE TRIGGER trg_touch_ingress_filter BEFORE UPDATE ON ingress_filters
+    FOR EACH ROW EXECUTE FUNCTION ringdown_touch_updated_at();
+
+-- One-time migration of the fleet's existing rsyslog exclusions plus the PHP
+-- session-clean noise that motivated centralized filtering.  ON CONFLICT
+-- preserves any operator-created row with the same name.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM ringdown_schema_migrations
+        WHERE version = '2026-07-27-default-ingress-filters'
+    ) THEN
+        INSERT INTO ingress_filters
+            (name, match_type, pattern, program_glob, filter_order, created_by, created_by_upn)
+        VALUES
+            ('routine sysstat service lifecycle', 'regex',
+             '^(?:Starting sysstat-collect\.service - system activity accounting tool\.\.\.|Finished sysstat-collect\.service - system activity accounting tool\.|sysstat-collect\.service: Deactivated successfully\.)$',
+                                                                            'systemd', 10, 'system', 'schema migration'),
+            ('routine sysstat cron',       'substring', 'debian-sa1',      'CRON',    20, 'system', 'schema migration'),
+            ('routine sysstat cron service', 'substring', 'sysstat-collect', 'CRON',   25, 'system', 'schema migration'),
+            ('cron PAM sessions',          'substring', 'pam_unix(cron:session): session ', 'CRON',
+                                                                                       30, 'system', 'schema migration'),
+            ('PHP session cleanup lifecycle', 'regex',
+             '^(?:Starting phpsessionclean\.service - Clean php session files\.\.\.|Finished phpsessionclean\.service - Clean php session files\.|phpsessionclean\.service: Deactivated successfully\.)$',
+                                                                            'systemd', 40, 'system', 'schema migration'),
+            ('PHP session cleanup cron',   'substring', '/usr/lib/php/sessionclean', 'CRON',
+                                                                                       50, 'system', 'schema migration')
+        ON CONFLICT (name) DO NOTHING;
+        INSERT INTO ringdown_schema_migrations(version)
+        VALUES ('2026-07-27-default-ingress-filters')
+        ON CONFLICT DO NOTHING;
+    END IF;
+END $$;
 
 -- --- retention (SPEC: this is a monitoring plane, NOT a log archive) --------
 -- Ringdown keeps a rolling window, not history. `keep_days` old:
@@ -253,7 +345,7 @@ CREATE TABLE IF NOT EXISTS alert_incidents (
 );
 CREATE INDEX IF NOT EXISTS alert_incidents_rule ON alert_incidents (rule_id, last_event_at DESC);
 
--- --- audit: every rule/target CRUD + every dispatch (chmod 600 on disk too) -
+-- --- audit: filter/rule/target CRUD + every dispatch (chmod 600 on disk too) -
 CREATE TABLE IF NOT EXISTS audit (
     id         bigint       GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     ts         timestamptz  NOT NULL DEFAULT now(),
@@ -350,3 +442,22 @@ CREATE TRIGGER trg_notify_targets AFTER INSERT OR UPDATE OR DELETE ON targets
     FOR EACH ROW EXECUTE FUNCTION ringdown_notify_rules_changed();
 CREATE TRIGGER trg_notify_binds   AFTER INSERT OR UPDATE OR DELETE ON rule_targets
     FOR EACH ROW EXECUTE FUNCTION ringdown_notify_rules_changed();
+
+-- Filter changes use their own channel so drop-counter writes never cause rule
+-- reloads and rule/target edits never cause filter recompilation.
+CREATE OR REPLACE FUNCTION ringdown_notify_filters_changed()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    payload text;
+    row_id  text;
+BEGIN
+    row_id := COALESCE((to_jsonb(NEW)->>'id'), (to_jsonb(OLD)->>'id'), '');
+    payload := json_build_object('op', TG_OP, 'id', row_id)::text;
+    PERFORM pg_notify('filters_changed', payload);
+    RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_notify_ingress_filters ON ingress_filters;
+CREATE TRIGGER trg_notify_ingress_filters
+    AFTER INSERT OR UPDATE OR DELETE ON ingress_filters
+    FOR EACH ROW EXECUTE FUNCTION ringdown_notify_filters_changed();

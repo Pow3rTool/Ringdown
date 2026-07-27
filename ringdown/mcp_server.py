@@ -5,9 +5,10 @@ targets. Same front-door shape as the Ringdown prototype / partyline / cloudflar
 request carries an Entra bearer, cryptographically validated
 (JWKS sig/aud/iss/exp/scope/client) before anything runs. There is NO unauth path.
 
-Roles: Ringdown.Read = query. Ringdown.Write = curate rules/targets (Write also
-satisfies reads). Operator break-glass (config RINGDOWN_OPERATORS or the
-Ringdown.Operator role) can act on any owner's rows.
+Roles: Ringdown.Read = query. Ringdown.Write = curate owned rules/targets
+(Write also satisfies reads). Global ingress-filter mutation additionally
+requires operator/admin authority. Operator break-glass (config
+RINGDOWN_OPERATORS or the Ringdown.Operator role) can act on any owner's rows.
 
 Ownership: rules/targets are visible-to-all (read) but writable only
 by the owning (human oid, bot appid) pair, ∪ operator. A different bot acting as
@@ -21,21 +22,31 @@ Talks to Postgres only (no direct IPC with the collector). Run: python -m ringdo
 """
 from __future__ import annotations
 
+import calendar
 import json
 import re
 import sys
 import time
-import calendar
 from collections import namedtuple
 from contextlib import asynccontextmanager
 
+from mcp import types as _t
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
 
 from . import config
+from .filters import (
+    FilterValidationError,
+    compile_regex,
+    get_filter,
+    list_filters,
+    preview_filter,
+    purge_filter,
+    validate_filter_spec,
+)
 
 config.validate_mcp()
 
@@ -74,15 +85,14 @@ def _validate_target_config(ttype: str, cfg: dict) -> str | None:
     return None
 
 
-# ReDoS guard (sec review B5): an L1 pattern runs against EVERY ingested line on
-# the single-threaded collector loop, and Python `re` has no match timeout — a
-# catastrophic-backtracking pattern from a Write principal can wedge ingest
-# fleet-wide. We reject the two things that cause it: over-long patterns and a
-# quantifier applied to a group that itself contains an unbounded quantifier
-# (``(a+)+``, ``(.*)*``, ``(\d+|x)*`` …), plus absurd bounded repetition.
+# Complexity guard for stored L1 expressions and their PostgreSQL historical
+# previews. Live matching uses linear-time RE2; the preview still runs through
+# PostgreSQL's regex engine under a bounded query, so reject nested unbounded
+# quantifiers and absurd repetitions as defense in depth.
 _MAX_PATTERN_LEN = 512
 _NESTED_QUANT = re.compile(r"\([^()]*[+*][^()]*\)\s*[*+]|\([^()]*[+*][^()]*\)\s*\{\d*,?\d*\}")
 _BIG_REPEAT = re.compile(r"\{\s*(\d+)\s*(?:,\s*(\d+)\s*)?\}")
+
 
 def _regex_safe(pattern: str) -> str | None:
     """Returns an error string if the regex is a ReDoS risk on the hot path, else None."""
@@ -266,7 +276,7 @@ def _out(obj) -> str:
     s = json.dumps(obj, indent=2, ensure_ascii=False, default=str)
     if len(s) <= config.MAX_OUTPUT_CHARS:
         return s
-    return s[:config.MAX_OUTPUT_CHARS] + f"\n…[TRUNCATED — narrow your query]"
+    return s[:config.MAX_OUTPUT_CHARS] + "\n…[TRUNCATED — narrow your query]"
 
 
 # --- helpers: time parse, glob->LIKE (ported from the Ringdown prototype) --------------------
@@ -323,8 +333,11 @@ async def _lifespan(_server):
 
 mcp = FastMCP("ringdown",
     instructions=(
-        "Query the Ringdown log store and curate alert hooks + notification targets. Logs are "
+        "Query the Ringdown log store and curate alert hooks, notification targets, and ingress "
+        "filters. Logs are "
         "keyed by SOURCE (device/host) and time. Query: search_logs / timeline / list_sources. "
+        "Ingress filtering: list_ingress_filters / test_ingress_filter; global create/update/delete/"
+        "purge operations require Ringdown.Operator/Admin. "
         "Rules: register_alert / update_alert / delete_alert / disable_alert / list_alerts / "
         "test_alert / get_alert_history. Targets (how alerts reach a responder): register_target / "
         "update_target / delete_target / list_targets, and bind_target / unbind_target to attach a "
@@ -484,6 +497,234 @@ async def set_source_active(ctx: Context, source: str, active: bool = False) -> 
         return _err(f"no known source {source!r}.")
     await _audit(ident, "set_source_active", {"source": source, "active": bool(active)}, True)
     return _out({"updated": True, **row})
+
+
+# === global ingress-filter CRUD ==============================================
+@mcp.tool()
+async def list_ingress_filters(ctx: Context, include_disabled: bool = True) -> str:
+    """List centralized pre-storage filters and aggregate drop counters. Read-only.
+
+    These filters run before event/template persistence and before alert/semantic
+    evaluation. They are global fleet policy, not per-user alert rules."""
+    ident = _auth(ctx)
+    if ident is None:
+        return _err("unauthenticated: bearer failed validation")
+    ok, why = _authz(ident, write=False)
+    if not ok:
+        return _err(why)
+    rows = await list_filters(_pool, include_disabled=bool(include_disabled))
+    return _out({"count": len(rows), "filters": rows})
+
+
+@mcp.tool()
+async def test_ingress_filter(
+    ctx: Context,
+    match_type: str,
+    pattern: str,
+    name: str = "preview",
+    source_glob: str = "",
+    program_glob: str = "",
+    case_sensitive: bool = False,
+    limit: int = 20,
+) -> str:
+    """Preview a proposed filter against stored history without enabling or deleting anything.
+
+    match_type is 'substring' (preferred) or 'regex' (RE2 syntax). source_glob and
+    program_glob optionally scope it using '*'/'?'. The returned count and samples
+    use the same match semantics as live ingress."""
+    ident = _auth(ctx)
+    if ident is None:
+        return _err("unauthenticated: bearer failed validation")
+    ok, why = _authz(ident, write=False)
+    if not ok:
+        return _err(why)
+    try:
+        spec = validate_filter_spec(
+            name=name, match_type=match_type, pattern=pattern,
+            source_glob=source_glob, program_glob=program_glob,
+            case_sensitive=case_sensitive)
+        result = await preview_filter(_pool, spec, limit=limit)
+    except FilterValidationError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"preview failed: {type(exc).__name__}: {str(exc)[:200]}")
+    return _out({"filter": spec, **result})
+
+
+@mcp.tool()
+async def register_ingress_filter(
+    ctx: Context,
+    name: str,
+    match_type: str,
+    pattern: str,
+    source_glob: str = "",
+    program_glob: str = "",
+    case_sensitive: bool = False,
+    filter_order: int = 100,
+    enabled: bool = True,
+) -> str:
+    """Create a global pre-storage filter. Ringdown.Operator/Admin only.
+
+    Prefer match_type='substring'. Regex uses RE2's deliberately restricted,
+    linear-time syntax. The first enabled match by filter_order/id drops the line."""
+    ident = _auth(ctx)
+    if ident is None:
+        return _err("unauthenticated: bearer failed validation")
+    if not _is_admin(ident):
+        return _err("global ingress filters require Ringdown.Operator/Admin.")
+    try:
+        spec = validate_filter_spec(
+            name=name, match_type=match_type, pattern=pattern,
+            source_glob=source_glob, program_glob=program_glob,
+            case_sensitive=case_sensitive, filter_order=filter_order)
+        row = await _exec(
+            "INSERT INTO ingress_filters "
+            "(name, match_type, pattern, source_glob, program_glob, case_sensitive, filter_order, "
+            "enabled, created_by, created_by_upn, created_by_bot) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id, name, enabled",
+            (spec["name"], spec["match_type"], spec["pattern"], spec["source_glob"] or None,
+             spec["program_glob"] or None, spec["case_sensitive"], spec["filter_order"],
+             bool(enabled), ident.oid, ident.upn, ident.appid))
+    except FilterValidationError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"insert failed: {type(exc).__name__}: {str(exc)[:200]}")
+    await _audit(ident, "register_ingress_filter",
+                 {"id": row["id"], "name": row["name"], "match_type": spec["match_type"]}, True)
+    return _out({"registered": True, **row})
+
+
+@mcp.tool()
+async def update_ingress_filter(
+    ctx: Context,
+    filter_id: int,
+    name: str = "",
+    match_type: str = "",
+    pattern: str = "",
+    source_glob: str = "",
+    program_glob: str = "",
+    clear_source_glob: bool = False,
+    clear_program_glob: bool = False,
+    case_sensitive_set: str = "",
+    filter_order: int = -1,
+    enabled_set: str = "",
+) -> str:
+    """Edit a global filter. Ringdown.Operator/Admin only.
+
+    Empty strings leave fields unchanged; clear_source_glob/clear_program_glob
+    explicitly remove scopes. case_sensitive_set and enabled_set accept
+    'true'/'false'. filter_order=-1 leaves ordering unchanged."""
+    ident = _auth(ctx)
+    if ident is None:
+        return _err("unauthenticated: bearer failed validation")
+    if not _is_admin(ident):
+        return _err("global ingress filters require Ringdown.Operator/Admin.")
+    current = await get_filter(_pool, int(filter_id))
+    if not current:
+        return _err(f"no ingress filter with id {filter_id}.")
+    candidate = dict(current)
+    changed = []
+    for field, value in (("name", name), ("match_type", match_type), ("pattern", pattern)):
+        if value:
+            candidate[field] = value
+            changed.append(field)
+    if source_glob or clear_source_glob:
+        candidate["source_glob"] = "" if clear_source_glob else source_glob
+        changed.append("source_glob")
+    if program_glob or clear_program_glob:
+        candidate["program_glob"] = "" if clear_program_glob else program_glob
+        changed.append("program_glob")
+    if case_sensitive_set.lower() in ("true", "false"):
+        candidate["case_sensitive"] = case_sensitive_set.lower() == "true"
+        changed.append("case_sensitive")
+    elif case_sensitive_set:
+        return _err("case_sensitive_set must be 'true', 'false', or empty.")
+    if filter_order >= 0:
+        candidate["filter_order"] = filter_order
+        changed.append("filter_order")
+    enabled = bool(current["enabled"])
+    if enabled_set.lower() in ("true", "false"):
+        enabled = enabled_set.lower() == "true"
+        changed.append("enabled")
+    elif enabled_set:
+        return _err("enabled_set must be 'true', 'false', or empty.")
+    if not changed:
+        return _err("nothing to update.")
+    try:
+        spec = validate_filter_spec(
+            name=candidate["name"], match_type=candidate["match_type"],
+            pattern=candidate["pattern"], source_glob=candidate.get("source_glob") or "",
+            program_glob=candidate.get("program_glob") or "",
+            case_sensitive=bool(candidate.get("case_sensitive")),
+            filter_order=candidate["filter_order"])
+        row = await _exec(
+            "UPDATE ingress_filters SET name=%s, match_type=%s, pattern=%s, source_glob=%s, "
+            "program_glob=%s, case_sensitive=%s, filter_order=%s, enabled=%s "
+            "WHERE id=%s RETURNING id, name, enabled, updated_at",
+            (spec["name"], spec["match_type"], spec["pattern"], spec["source_glob"] or None,
+             spec["program_glob"] or None, spec["case_sensitive"], spec["filter_order"],
+             enabled, int(filter_id)))
+    except FilterValidationError as exc:
+        return _err(str(exc))
+    except Exception as exc:
+        return _err(f"update failed: {type(exc).__name__}: {str(exc)[:200]}")
+    await _audit(ident, "update_ingress_filter",
+                 {"filter_id": filter_id, "fields": sorted(set(changed))}, True)
+    return _out({"updated": True, **row})
+
+
+@mcp.tool()
+async def delete_ingress_filter(ctx: Context, filter_id: int) -> str:
+    """Delete a global filter and its aggregate stats. Stored events are untouched.
+    Ringdown.Operator/Admin only."""
+    ident = _auth(ctx)
+    if ident is None:
+        return _err("unauthenticated: bearer failed validation")
+    if not _is_admin(ident):
+        return _err("global ingress filters require Ringdown.Operator/Admin.")
+    current = await get_filter(_pool, int(filter_id))
+    if not current:
+        return _err(f"no ingress filter with id {filter_id}.")
+    await _exec("DELETE FROM ingress_filters WHERE id = %s", (int(filter_id),))
+    await _audit(ident, "delete_ingress_filter",
+                 {"filter_id": filter_id, "name": current["name"]}, True)
+    return _out({"deleted": True, "id": filter_id, "name": current["name"]})
+
+
+@mcp.tool()
+async def purge_ingress_filter(
+    ctx: Context,
+    filter_id: int,
+    confirm_name: str,
+    batch_size: int = 50_000,
+) -> str:
+    """Retroactively delete one bounded batch of stored matches. Operator/Admin only.
+
+    Safety interlock: confirm_name must exactly equal the stored filter name.
+    Re-run while batch_limit_reached=true. Ordinary deletion frees space for
+    PostgreSQL reuse; a separately scheduled partition rewrite/VACUUM FULL is
+    required to return file space to the OS."""
+    ident = _auth(ctx)
+    if ident is None:
+        return _err("unauthenticated: bearer failed validation")
+    if not _is_admin(ident):
+        return _err("historical purge requires Ringdown.Operator/Admin.")
+    current = await get_filter(_pool, int(filter_id))
+    if not current:
+        return _err(f"no ingress filter with id {filter_id}.")
+    if confirm_name != current["name"]:
+        return _err("confirmation failed: confirm_name must exactly equal the stored filter name.")
+    try:
+        result = await purge_filter(_pool, dict(current), batch_size=batch_size)
+    except Exception as exc:
+        await _audit(ident, "purge_ingress_filter",
+                     {"filter_id": filter_id, "name": current["name"], "error": type(exc).__name__},
+                     False)
+        return _err(f"purge failed: {type(exc).__name__}: {str(exc)[:200]}")
+    await _audit(ident, "purge_ingress_filter",
+                 {"filter_id": filter_id, "name": current["name"],
+                  "deleted": result["deleted"], "batch_size": result["batch_size"]}, True)
+    return _out({"filter_id": filter_id, "name": current["name"], **result})
 
 
 # === target CRUD =============================================================
@@ -648,7 +889,7 @@ async def register_alert(ctx: Context, name: str, kind: str, pattern: str, instr
                          rule_order: int = 100, stop_on_match: bool = False, project_id: str = "",
                          targets: str = "") -> str:
     """Register an alert hook (needs Ringdown.Write). REQUIRED: name, kind, pattern.
-      • kind='regex'    — `pattern` matched on every incoming line (L1, cheap).
+      • kind='regex'    — RE2 `pattern` matched on every accepted incoming line (L1, cheap).
       • kind='semantic' — `pattern` is a PLAIN-ENGLISH condition an LLM judges over windows (L2).
       • instructions    — per-rule triage guidance handed to the agent when it fires (strongly rec.).
       • source_glob     — restrict to devices ('rtr*'); min_severity — OTel floor (>=).
@@ -677,9 +918,9 @@ async def register_alert(ctx: Context, name: str, kind: str, pattern: str, instr
         return _err("window_kind must be 'sliding' or 'tumbling'.")
     if kind == "regex":
         try:
-            re.compile(pattern)
-        except re.error as e:
-            return _err(f"invalid regex pattern: {e}")
+            compile_regex(pattern, case_sensitive=True)
+        except FilterValidationError as e:
+            return _err(str(e))
         unsafe = _regex_safe(pattern)
         if unsafe:
             return _err(unsafe)
@@ -758,9 +999,9 @@ async def update_alert(ctx: Context, rule_id: int, pattern: str = "", instructio
         try:
             kind = (await _fetchone("SELECT kind FROM alert_rules WHERE id = %s", (int(rule_id),)))["kind"]
             if kind == "regex":
-                re.compile(pattern)
-        except re.error as e:
-            return _err(f"invalid regex pattern: {e}")
+                compile_regex(pattern, case_sensitive=True)
+        except FilterValidationError as e:
+            return _err(str(e))
         if kind == "regex":
             unsafe = _regex_safe(pattern)
             if unsafe:
@@ -934,9 +1175,9 @@ async def test_alert(ctx: Context, kind: str, pattern: str, source_glob: str = "
         where.append("severity >= %s"); params.append(int(min_severity))
     if kind == "regex":
         try:
-            re.compile(pattern)
-        except re.error as e:
-            return _err(f"invalid regex pattern: {e}")
+            compile_regex(pattern, case_sensitive=True)
+        except FilterValidationError as e:
+            return _err(str(e))
         unsafe = _regex_safe(pattern)
         if unsafe:
             return _err(unsafe)
@@ -979,7 +1220,6 @@ async def get_alert_history(ctx: Context, rule_id: int = 0, since_seconds: float
 
 
 # Drop resource/prompt handlers we don't implement.
-from mcp import types as _t
 for _rt in (_t.ListResourcesRequest, _t.ReadResourceRequest, _t.ListResourceTemplatesRequest,
             _t.ListPromptsRequest, _t.GetPromptRequest, _t.SubscribeRequest, _t.UnsubscribeRequest):
     mcp._mcp_server.request_handlers.pop(_rt, None)

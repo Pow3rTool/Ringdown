@@ -16,17 +16,21 @@ Two long-running processes share one Postgres database and never talk directly �
 at the DB (rows plus `LISTEN/NOTIFY`):
 
 ```
-syslog (UDP/TCP 514) → collector → Postgres ← control plane ← operators / agents
-                          │  match rules                (CRUD rules & targets;
-                          ▼                               a trigger NOTIFYs)
+syslog (UDP/TCP 514) → collector → ingress filters → Postgres ← control plane
+                                              │         ↑       operators / agents
+                                              │ match rules     (CRUD filters/rules/targets;
+                                              ▼                  triggers NOTIFY)
                      dispatch → pluggable targets (human push, agent hand-off, …)
 ```
 
-- **`ringdown.collector`** — the hot path: ingest syslog, normalize and template-mine, store,
-  match the in-memory ruleset, and dispatch. The ruleset refreshes on a Postgres `NOTIFY`, not
-  per line. An optional LLM-judged loop handles signals that plain rules miss.
+- **`ringdown.collector`** — the hot path: ingest syslog, normalize, discard centrally managed
+  routine noise, template-mine and store accepted events, match the in-memory ruleset, and
+  dispatch. Filter/rule sets refresh on Postgres `NOTIFY`, not per line. An optional LLM-judged
+  loop handles signals that plain rules miss.
 - **`ringdown.mcp_server`** — an authenticated control plane for querying the log store and
-  managing alert rules and notification targets.
+  managing global ingress filters, alert rules, and notification targets.
+- **`ringdown.webui`** — the admin live tail plus ingress-filter CRUD, historical preview, and
+  confirmation-gated bounded purge.
 
 ## Layout
 
@@ -35,8 +39,10 @@ ringdown/
   config.py         environment load + validation
   db.py             pooled DB access + the LISTEN/NOTIFY listener
   schema.sql        Postgres schema + NOTIFY triggers
+  migrate.py        transactional idempotent schema runner
   syslog_parse.py   RFC5424 / RFC3164 decode + template mining
-  collector.py      hot path: ingest → match → dispatch
+  filters.py        RE2/substring ingress matching + preview/purge helpers
+  collector.py      hot path: ingest → filter → store → match → dispatch
   ruleset.py        in-memory compiled ruleset (NOTIFY-refreshed)
   router.py         match + fan-out + coalesce
   incidents.py      dispatch coordinator: dedup / feed / throttle / fallback
@@ -71,6 +77,18 @@ pytest -q
 
 See `deploy/` for the systemd units and `.env.example` for the full list of configuration
 options.
+
+Re-apply `ringdown/schema.sql` before deploying a version that introduces schema changes:
+
+```bash
+python -m ringdown.migrate
+```
+
+The schema is idempotent and applied transactionally; one-time data migrations are tracked in
+`ringdown_schema_migrations`.
+Historical filter purges use bounded batches and make deleted space reusable by PostgreSQL.
+Returning that space to the operating system still requires a separately scheduled partition
+rewrite or `VACUUM FULL`.
 
 ## License
 

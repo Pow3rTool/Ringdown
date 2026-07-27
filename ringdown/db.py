@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
 
 import psycopg
 from psycopg.rows import dict_row
+
+if TYPE_CHECKING:
+    from psycopg_pool import AsyncConnectionPool
 
 
 def make_pool(dsn: str, *, min_size: int = 1, max_size: int = 4):

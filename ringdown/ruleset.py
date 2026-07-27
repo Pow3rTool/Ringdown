@@ -8,9 +8,8 @@ refetch later if it ever isn't.
 """
 from __future__ import annotations
 
-import re
-
 from . import db
+from .filters import FilterValidationError, compile_regex
 
 
 class Ruleset:
@@ -48,8 +47,8 @@ class Ruleset:
         compiled = []
         for r in rows:
             try:
-                rx = re.compile(r["pattern"])
-            except re.error:
+                rx = compile_regex(r["pattern"], case_sensitive=True)
+            except FilterValidationError:
                 continue  # a bad regex is skipped, not fatal (MCP validates on write)
             targets = by_rule.get(r["id"], [])
             if not targets and not r["stop_on_match"]:

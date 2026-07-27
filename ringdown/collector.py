@@ -1,11 +1,12 @@
-"""ringdown.collector — the hot path: ingest -> store -> match -> dispatch.
+"""ringdown.collector — the hot path: ingest -> filter -> store -> match -> dispatch.
 
-One long-running process. Listens syslog (UDP+TCP), parses + template-mines +
-batch-inserts to Postgres (ported from the Ringdown prototype), matches the in-memory L1
-ruleset per line, and dispatches through the pluggable target coordinator. The
-ruleset refreshes on Postgres ``rules_changed`` NOTIFY, never per-line.
+One long-running process. Listens syslog (UDP+TCP), parses, applies the in-memory
+ingress filter set, template-mines + batch-inserts accepted events to Postgres,
+matches the in-memory L1 ruleset per line, and dispatches through the pluggable
+target coordinator. Rules and filters refresh through Postgres NOTIFY, never a
+per-line database read.
 
-  listeners -> asyncio.Queue -> batched flush -> Router.consider -> Coordinator
+  listeners -> asyncio.Queue -> ingress filters -> batched flush -> Router -> Coordinator
 
 Talks to the control-plane (ringdown.mcp_server) ONLY through Postgres — no
 direct IPC. Run:  python -m ringdown.collector
@@ -23,6 +24,7 @@ from psycopg.types.json import Jsonb
 
 from . import config, db
 from .dispatch import build_registry
+from .filters import IngressFilterSet
 from .incidents import Coordinator
 from .obo import TurnstoneAdmin
 from .router import Router
@@ -36,8 +38,9 @@ def _monday(dt: datetime):
     return (d - timedelta(days=d.weekday())).date()
 
 
-async def flush(conn, batch: list[dict]) -> None:
-    if not batch:
+async def flush(conn, batch: list[dict], dropped=None) -> None:
+    """Atomically store accepted events and aggregate body-free drop counters."""
+    if not batch and not dropped:
         return
     weeks = {_monday(ev["ts"]) for ev in batch}
     async with conn.cursor() as cur:
@@ -71,6 +74,15 @@ async def flush(conn, batch: list[dict]) -> None:
                 "INSERT INTO sources (source, events) VALUES (%s,%s) "
                 "ON CONFLICT (source) DO UPDATE SET last_seen = now(), "
                 "events = sources.events + EXCLUDED.events, active = true", (src, n))
+        for (filter_id, source), count in (dropped or {}).items():
+            await cur.execute(
+                "INSERT INTO ingress_filter_stats (filter_id, source, matched) "
+                "SELECT %s,%s,%s WHERE EXISTS "
+                "(SELECT 1 FROM ingress_filters WHERE id = %s) "
+                "ON CONFLICT (filter_id, source) DO UPDATE SET "
+                "matched = ingress_filter_stats.matched + EXCLUDED.matched, "
+                "last_matched = now()",
+                (filter_id, source, count, filter_id))
     await conn.commit()
 
 
@@ -103,32 +115,34 @@ async def _tcp_client(reader, writer, q):
         writer.close()
 
 
-async def flusher(q, stop, router: Router):
+async def flusher(q, stop, router: Router, ingress_filters: IngressFilterSet):
     async with await psycopg.AsyncConnection.connect(config.DB_DSN, autocommit=False) as conn:
         print(f"[flusher] connected; batch<= {config.BATCH_MAX} / {config.BATCH_MS}ms", flush=True)
         loop = asyncio.get_event_loop()
         while not (stop.is_set() and q.empty()):
-            batch = []
+            received = []
             try:
                 first = await asyncio.wait_for(q.get(), timeout=0.5)
-                batch.append(parse_syslog(*first))
+                received.append(parse_syslog(*first))
             except asyncio.TimeoutError:
                 continue
             deadline = loop.time() + config.BATCH_MS / 1000
-            while len(batch) < config.BATCH_MAX:
+            while len(received) < config.BATCH_MAX:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     break
                 try:
                     item = await asyncio.wait_for(q.get(), timeout=remaining)
-                    batch.append(parse_syslog(*item))
+                    received.append(parse_syslog(*item))
                 except asyncio.TimeoutError:
                     break
+            batch, dropped = ingress_filters.partition(received)
             try:
-                await flush(conn, batch)
+                await flush(conn, batch, dropped)
                 router.consider(batch)  # L1 match + dispatch, off the commit path
             except Exception as e:
-                print(f"[flusher] FLUSH FAILED ({type(e).__name__}: {e}); dropping {len(batch)}",
+                print(f"[flusher] FLUSH FAILED ({type(e).__name__}: {e}); "
+                      f"losing {len(received)} received line(s)",
                       file=sys.stderr, flush=True)
                 await conn.rollback()
 
@@ -191,8 +205,13 @@ async def main() -> None:
                               fallback_ntfy_topic=config.FALLBACK_NTFY_TOPIC)
     ruleset = Ruleset(pool)
     await ruleset.reload()
+    ingress_filters = IngressFilterSet(pool)
+    await ingress_filters.reload()
     router = Router(ruleset, coordinator)
-    print(f"[ringdown] live: {len(ruleset)} L1 rule(s) | dispatchers={sorted(registry)}", flush=True)
+    print(f"[ringdown] live: {len(ruleset)} L1 rule(s) | "
+          f"{len(ingress_filters)} ingress filter(s) | dispatchers={sorted(registry)}", flush=True)
+    for rejected in ingress_filters.rejected:
+        print(f"[filters] SKIPPED invalid {rejected}", file=sys.stderr, flush=True)
 
     # listeners
     transports, servers = [], []
@@ -214,8 +233,21 @@ async def main() -> None:
         except Exception as e:
             print(f"[ruleset] reload failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
-    fl = asyncio.create_task(flusher(q, stop, router))
-    ls = asyncio.create_task(db.listen(config.DB_DSN, "rules_changed", _on_notify, stop))
+    async def _on_filter_notify(_payload: str):
+        try:
+            await ingress_filters.reload()
+            print(f"[filters] reloaded: {len(ingress_filters)} enabled", flush=True)
+            for rejected in ingress_filters.rejected:
+                print(f"[filters] SKIPPED invalid {rejected}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[filters] reload failed: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+
+    fl = asyncio.create_task(flusher(q, stop, router, ingress_filters))
+    rule_listener = asyncio.create_task(
+        db.listen(config.DB_DSN, "rules_changed", _on_notify, stop))
+    filter_listener = asyncio.create_task(
+        db.listen(config.DB_DSN, "filters_changed", _on_filter_notify, stop))
     mt = asyncio.create_task(maintenance(pool, stop))
 
     # optional L2 semantic judge loop
@@ -240,6 +272,7 @@ async def main() -> None:
         srv.close()
     await fl
     await mt
+    await asyncio.gather(rule_listener, filter_listener)
     if sem:
         await sem
     await router.drain()

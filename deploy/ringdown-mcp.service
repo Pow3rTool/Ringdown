@@ -1,5 +1,5 @@
 [Unit]
-Description=ringdown-mcp — Entra-gated control plane (query + rule/target CRUD)
+Description=ringdown-mcp — Entra-gated control plane (query + filter/rule/target CRUD)
 After=network-online.target
 Wants=network-online.target
 

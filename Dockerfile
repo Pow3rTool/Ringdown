@@ -1,7 +1,7 @@
 # Ringdown — single image, three roles (collector / mcp_server / webui),
 # selected by the container command (see each Quadlet's Exec=).
 #
-# Pure-Python, PyPI wheels only (psycopg[binary,pool], uvicorn, mcp/FastMCP,
+# PyPI wheels only (psycopg[binary,pool], google-re2, uvicorn, mcp/FastMCP,
 # pyjwt[crypto]) — no apt build deps, no compiler.
 #
 # Config + secrets are NEVER baked. At runtime the deploy mounts (read-only):

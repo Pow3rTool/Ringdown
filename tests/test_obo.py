@@ -6,8 +6,6 @@ identity and the per-user least-privilege model is defeated.
 """
 import time
 
-import pytest
-
 from ringdown.obo import TurnstoneAdmin
 
 

@@ -1,9 +1,11 @@
 """ringdown.webui — admin-only live view (log tail + alerts + semantic-eval trace) over Entra SSO.
 
-A separate process from the collector and the MCP; it only READS the shared
-Postgres. Auth is the OIDC authorization-code flow (PKCE) with **private_key_jwt
-client authentication** — a certificate, not a shared secret — and access is gated
-on the ``Ringdown.Admin`` app role carried in the ID token. No Graph calls.
+A separate process from the collector and the MCP. It reads the live/event
+views and provides an admin-only ingress-filter control plane over shared
+Postgres. Auth is the OIDC authorization-code flow (PKCE) with
+**private_key_jwt client authentication** — a certificate, not a shared secret
+— and access is gated on the ``Ringdown.Admin`` app role carried in the ID
+token. No Graph calls.
 
   browser -> /auth/login -> Entra -> /auth/callback (code+PKCE, cert assertion)
           -> validate id_token (JWKS/aud/iss/nonce) -> require admin role
@@ -23,7 +25,8 @@ import secrets
 import time
 import uuid
 from html import escape
-from urllib.parse import urlencode
+from pathlib import Path
+from urllib.parse import urlencode, urlparse
 
 import httpx
 import jwt
@@ -33,11 +36,25 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from jwt import PyJWKClient
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import (HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse,
-                                  StreamingResponse)
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from starlette.routing import Route
 
 from . import config, db
+from .filters import (
+    FilterValidationError,
+    get_filter,
+    list_filters,
+    preview_filter,
+    purge_filter,
+    validate_filter_spec,
+)
 
 # `offline_access` asks Entra for a refresh token so the operator can be kept
 # signed in without the full interactive flow. In the v2.0 endpoint this is an
@@ -47,6 +64,16 @@ from . import config, db
 _SCOPE = "openid profile email offline_access"
 _ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 _jwks = PyJWKClient(f"{config.AUTHORITY}/discovery/v2.0/keys")
+_FAVICON_DIR = Path(__file__).with_name("static")
+_FAVICON_ASSETS = {
+    "/favicon.ico": ("favicon.ico", "image/vnd.microsoft.icon"),
+    "/favicon-16x16.png": ("favicon-16x16.png", "image/png"),
+    "/favicon-32x32.png": ("favicon-32x32.png", "image/png"),
+    "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
+    "/android-chrome-192x192.png": ("android-chrome-192x192.png", "image/png"),
+    "/android-chrome-512x512.png": ("android-chrome-512x512.png", "image/png"),
+    "/site.webmanifest": ("site.webmanifest", "application/manifest+json"),
+}
 
 
 # --- OIDC helpers ------------------------------------------------------------
@@ -284,7 +311,7 @@ async def logout(request):
     return resp
 
 
-# --- data (read-only) + SSE --------------------------------------------------
+# --- data + SSE ---------------------------------------------------------------
 def _iso(ts) -> str:
     return ts.strftime("%H:%M:%S") if hasattr(ts, "strftime") else "?"
 
@@ -330,10 +357,12 @@ def _ev_filters(qp) -> tuple[list, list]:
     except ValueError:
         sev = 0
     if sev > 0:
-        clauses.append("severity >= %s"); params.append(sev)
+        clauses.append("severity >= %s")
+        params.append(sev)
     src = (qp.get("src") or "").strip()
     if src:
-        clauses.append("source ILIKE %s"); params.append(f"%{src}%")
+        clauses.append("source ILIKE %s")
+        params.append(f"%{src}%")
     q = (qp.get("q") or "").strip()
     if q:
         clauses.append("(source ILIKE %s OR program ILIKE %s OR body ILIKE %s)")
@@ -364,10 +393,176 @@ def _q_cond(qp, cols: tuple[str, ...]) -> tuple[str, list]:
     return "(" + " OR ".join(f"{c} ILIKE %s" for c in cols) + ")", [f"%{q}%"] * len(cols)
 
 
+def _jsonable(value):
+    """Convert datetime/Row values to JSON-safe builtins without leaking internals."""
+    return json.loads(json.dumps(value, default=str))
+
+
+async def _json_request(request) -> tuple[dict | None, JSONResponse | None]:
+    """Small JSON-only mutation gate. SameSite cookies plus JSON and Origin
+    checking prevent a third-party form from driving the admin control plane."""
+    origin = request.headers.get("origin")
+    if origin and urlparse(origin).netloc.lower() != request.headers.get("host", "").lower():
+        return None, JSONResponse({"error": "cross-origin request refused"}, 403)
+    try:
+        length = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        length = 0
+    if length > 32_768:
+        return None, JSONResponse({"error": "request body too large"}, 413)
+    if "application/json" not in request.headers.get("content-type", "").lower():
+        return None, JSONResponse({"error": "application/json required"}, 415)
+    try:
+        body = await request.json()
+    except Exception:
+        return None, JSONResponse({"error": "invalid JSON body"}, 400)
+    if not isinstance(body, dict):
+        return None, JSONResponse({"error": "JSON body must be an object"}, 400)
+    return body, None
+
+
+def _spec_from_body(body: dict) -> dict:
+    case_sensitive = body.get("case_sensitive", False)
+    if not isinstance(case_sensitive, bool):
+        raise FilterValidationError("case_sensitive must be a JSON boolean.")
+    return validate_filter_spec(
+        name=body.get("name", ""),
+        match_type=body.get("match_type", ""),
+        pattern=body.get("pattern", ""),
+        source_glob=body.get("source_glob", ""),
+        program_glob=body.get("program_glob", ""),
+        case_sensitive=case_sensitive,
+        filter_order=body.get("filter_order", 100),
+    )
+
+
+def _enabled_from_body(body: dict) -> bool:
+    enabled = body.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise FilterValidationError("enabled must be a JSON boolean.")
+    return enabled
+
+
+async def filters_collection(request):
+    """List/create global ingress filters (the whole WebUI is admin-only)."""
+    sess = await _load_session(request)
+    if sess is None:
+        return JSONResponse({"error": "unauthenticated"}, 401)
+    pool = request.app.state.pool
+    if request.method == "GET":
+        rows = await list_filters(pool, include_disabled=True)
+        return JSONResponse({"filters": _jsonable(rows)})
+    body, error = await _json_request(request)
+    if error:
+        return error
+    try:
+        spec = _spec_from_body(body)
+        enabled = _enabled_from_body(body)
+        row = await db.execute(
+            pool,
+            "INSERT INTO ingress_filters "
+            "(name, match_type, pattern, source_glob, program_glob, case_sensitive, filter_order, "
+            "enabled, created_by, created_by_upn, created_by_bot) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'webui') "
+            "RETURNING id, name, enabled, created_at, updated_at",
+            (spec["name"], spec["match_type"], spec["pattern"], spec["source_glob"] or None,
+             spec["program_glob"] or None, spec["case_sensitive"], spec["filter_order"],
+             enabled, sess.get("oid"), sess.get("upn")))
+    except FilterValidationError as exc:
+        return JSONResponse({"error": str(exc)}, 400)
+    except Exception as exc:
+        return JSONResponse({"error": f"create failed: {type(exc).__name__}: {str(exc)[:160]}"}, 409)
+    await _audit(pool, sess.get("oid"), sess.get("upn"), "webui_register_ingress_filter", True,
+                 {"id": row["id"], "name": row["name"], "match_type": spec["match_type"]})
+    return JSONResponse({"created": _jsonable(row)}, 201)
+
+
+async def filters_preview(request):
+    sess = await _load_session(request)
+    if sess is None:
+        return JSONResponse({"error": "unauthenticated"}, 401)
+    body, error = await _json_request(request)
+    if error:
+        return error
+    try:
+        spec = _spec_from_body(body)
+        result = await preview_filter(
+            request.app.state.pool, spec, limit=min(int(body.get("limit") or 20), 100))
+    except FilterValidationError as exc:
+        return JSONResponse({"error": str(exc)}, 400)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"preview failed: {type(exc).__name__}: {str(exc)[:160]}"}, 400)
+    return JSONResponse(_jsonable(result))
+
+
+async def filter_item(request):
+    sess = await _load_session(request)
+    if sess is None:
+        return JSONResponse({"error": "unauthenticated"}, 401)
+    pool = request.app.state.pool
+    filter_id = int(request.path_params["id"])
+    current = await get_filter(pool, filter_id)
+    if not current:
+        return JSONResponse({"error": "filter not found"}, 404)
+    if request.method == "DELETE":
+        await db.execute(pool, "DELETE FROM ingress_filters WHERE id = %s", (filter_id,))
+        await _audit(pool, sess.get("oid"), sess.get("upn"), "webui_delete_ingress_filter", True,
+                     {"id": filter_id, "name": current["name"]})
+        return JSONResponse({"deleted": True, "id": filter_id})
+    body, error = await _json_request(request)
+    if error:
+        return error
+    try:
+        spec = _spec_from_body(body)
+        enabled = _enabled_from_body(body)
+        row = await db.execute(
+            pool,
+            "UPDATE ingress_filters SET name=%s, match_type=%s, pattern=%s, source_glob=%s, "
+            "program_glob=%s, case_sensitive=%s, filter_order=%s, enabled=%s "
+            "WHERE id=%s RETURNING id, name, enabled, updated_at",
+            (spec["name"], spec["match_type"], spec["pattern"], spec["source_glob"] or None,
+             spec["program_glob"] or None, spec["case_sensitive"], spec["filter_order"],
+             enabled, filter_id))
+    except FilterValidationError as exc:
+        return JSONResponse({"error": str(exc)}, 400)
+    except Exception as exc:
+        return JSONResponse({"error": f"update failed: {type(exc).__name__}: {str(exc)[:160]}"}, 409)
+    await _audit(pool, sess.get("oid"), sess.get("upn"), "webui_update_ingress_filter", True,
+                 {"id": filter_id, "name": row["name"]})
+    return JSONResponse({"updated": _jsonable(row)})
+
+
+async def filter_purge(request):
+    sess = await _load_session(request)
+    if sess is None:
+        return JSONResponse({"error": "unauthenticated"}, 401)
+    pool = request.app.state.pool
+    filter_id = int(request.path_params["id"])
+    current = await get_filter(pool, filter_id)
+    if not current:
+        return JSONResponse({"error": "filter not found"}, 404)
+    body, error = await _json_request(request)
+    if error:
+        return error
+    if body.get("confirm_name") != current["name"]:
+        return JSONResponse(
+            {"error": "confirmation failed: enter the filter's exact name"}, 400)
+    try:
+        result = await purge_filter(
+            pool, dict(current), batch_size=int(body.get("batch_size") or 50_000))
+    except Exception as exc:
+        await _audit(pool, sess.get("oid"), sess.get("upn"), "webui_purge_ingress_filter",
+                     False, {"id": filter_id, "error": type(exc).__name__})
+        return JSONResponse({"error": f"purge failed: {type(exc).__name__}: {str(exc)[:160]}"}, 400)
+    await _audit(pool, sess.get("oid"), sess.get("upn"), "webui_purge_ingress_filter", True,
+                 {"id": filter_id, "name": current["name"], "deleted": result["deleted"]})
+    return JSONResponse(_jsonable(result))
+
+
 async def stream(request):
     if await _load_session(request) is None:
         return PlainTextResponse("unauthenticated", 401)
-    sid = _sid_from_cookie(request)
     pool = request.app.state.pool
     qp = request.query_params
     kinds = _kinds(qp)
@@ -534,8 +729,19 @@ async def healthz(request):
     return PlainTextResponse("ok")
 
 
+async def favicon_asset(request):
+    """Serve the conventional root-level favicon URLs without requiring login."""
+    filename, media_type = _FAVICON_ASSETS[request.url.path]
+    return FileResponse(
+        _FAVICON_DIR / filename,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 def _msg(title: str, detail: str) -> str:
-    t = title.replace("<", "&lt;"); d = detail.replace("<", "&lt;")
+    t = title.replace("<", "&lt;")
+    d = detail.replace("<", "&lt;")
     return (f"<!doctype html><meta charset=utf-8><title>Ringdown</title>"
             f"<body style='font:15px system-ui;background:#0b0e14;color:#c9d1d9;padding:3rem'>"
             f"<h2 style='color:#e6edf3'>{t}</h2><p style='color:#8b949e'>{d}</p>"
@@ -556,6 +762,7 @@ async def _lifespan(app):
 
 def build_app() -> Starlette:
     return Starlette(lifespan=_lifespan, routes=[
+        *[Route(path, favicon_asset) for path in _FAVICON_ASSETS],
         Route("/", index),
         Route("/auth/login", login),
         Route("/auth/callback", callback),
@@ -563,6 +770,10 @@ def build_app() -> Starlette:
         Route("/api/stream", stream),
         Route("/api/keepalive", keepalive, methods=["POST"]),
         Route("/api/eval/{id}", eval_detail),
+        Route("/api/filters", filters_collection, methods=["GET", "POST"]),
+        Route("/api/filters/preview", filters_preview, methods=["POST"]),
+        Route("/api/filters/{id:int}", filter_item, methods=["PUT", "DELETE"]),
+        Route("/api/filters/{id:int}/purge", filter_purge, methods=["POST"]),
         Route("/healthz", healthz),
     ])
 
@@ -570,6 +781,12 @@ def build_app() -> Starlette:
 _PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Ringdown · live</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0e14">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
 <style>
   :root{ --bg:#0b0e14; --fg:#c9d1d9; --dim:#6e7681; --panel:#0e131b; --line:#1c2230; --in:#10151f; }
   *{box-sizing:border-box}
@@ -581,6 +798,10 @@ _PAGE = """<!doctype html>
   header .s{color:var(--dim);font-weight:400}
   header .grow{flex:1}
   header a{color:#58a6ff;text-decoration:none}
+  header .nav{display:flex;gap:3px}
+  header .nav button{background:transparent;color:var(--dim);border:0;border-bottom:2px solid transparent;
+    padding:3px 8px;font:inherit;cursor:pointer}
+  header .nav button.on{color:#e6edf3;border-bottom-color:#58a6ff}
   header .dot{width:9px;height:9px;border-radius:50%;background:#3fb950;display:inline-block;margin-right:5px}
   header .dot.off{background:#f85149}
   #bar{position:sticky;top:37px;z-index:2;display:flex;flex-wrap:wrap;gap:8px;align-items:center;
@@ -593,6 +814,41 @@ _PAGE = """<!doctype html>
     color:var(--fg);cursor:pointer}
   #bar .btn:hover{border-color:#388bfd}
   #wrap{padding:6px 0 44px}
+  [hidden]{display:none!important}
+  #filtersPane{padding:18px 20px 60px;max-width:1250px;margin:0 auto}
+  #filtersPane h2{margin:0 0 4px;color:#e6edf3;font-size:17px}
+  #filtersPane .lead{color:var(--dim);margin-bottom:16px}
+  .filter-editor{display:grid;grid-template-columns:1.1fr .55fr 2fr .75fr;gap:9px;
+    padding:14px;background:var(--panel);border:1px solid var(--line);border-radius:7px}
+  .filter-editor label{display:flex;flex-direction:column;gap:4px;color:var(--dim);font-size:11px}
+  .filter-editor input,.filter-editor select{width:100%;background:var(--in);color:var(--fg);
+    border:1px solid var(--line);border-radius:5px;padding:7px 8px;font:inherit}
+  .filter-editor .wide{grid-column:span 2}
+  .filter-editor .checks{flex-direction:row;align-items:center;gap:14px;padding-top:20px}
+  .filter-editor .checks input{width:auto}
+  .filter-actions{grid-column:1/-1;display:flex;gap:8px;align-items:center}
+  button.action{background:#162033;color:#c9d1d9;border:1px solid #303b52;border-radius:5px;
+    padding:6px 11px;font:inherit;cursor:pointer}
+  button.action.primary{background:#1f6feb;border-color:#388bfd;color:white}
+  button.action.danger{background:#29181b;border-color:#6e3038;color:#ffb3ad}
+  button.action:hover{filter:brightness(1.18)}
+  #filterNote{color:var(--dim);margin-left:6px;white-space:pre-wrap}
+  #filterList{margin-top:15px;display:flex;flex-direction:column;gap:7px}
+  .filter-card{display:grid;grid-template-columns:54px minmax(180px,1fr) minmax(280px,2fr) 180px auto;
+    gap:10px;align-items:center;padding:10px 12px;background:var(--panel);
+    border:1px solid var(--line);border-left:3px solid #3fb950;border-radius:6px}
+  .filter-card.off{border-left-color:#6e7681;opacity:.72}
+  .filter-card .ord{color:var(--dim);font-variant-numeric:tabular-nums}
+  .filter-card .fname{color:#e6edf3;font-weight:600}
+  .filter-card .meta,.filter-card .stats{color:var(--dim);font-size:11px}
+  .filter-card .pat{word-break:break-word;color:#d2a8ff}
+  .filter-card .card-actions{display:flex;flex-wrap:wrap;gap:5px;justify-content:flex-end}
+  .filter-card .card-actions button{padding:3px 7px;font-size:11px}
+  @media(max-width:850px){
+    .filter-editor{grid-template-columns:1fr 1fr}.filter-editor .wide{grid-column:1/-1}
+    .filter-card{grid-template-columns:45px 1fr}.filter-card .pat,.filter-card .stats,
+    .filter-card .card-actions{grid-column:2}.filter-card .card-actions{justify-content:flex-start}
+  }
   .row{padding:1px 14px;white-space:pre-wrap;word-break:break-word;border-left:3px solid transparent}
   .row .ts{color:var(--dim)} .row .src{color:#79c0ff} .row .prog{color:#a5d6ff}
   .sev-err,.sev-crit,.sev-alert,.sev-emerg{color:#ff7b72}
@@ -629,6 +885,7 @@ _PAGE = """<!doctype html>
 </style></head>
 <body>
 <header><span class="t">RINGDOWN · live</span>
+  <span class="nav"><button id="tabLive" class="on">live</button><button id="tabFilters">filters</button></span>
   <span class="s"><span id="dot" class="dot"></span><span id="status">connecting…</span></span>
   <span class="s">logs <b id="nlog">0</b></span>
   <span class="s">alerts <b id="nalert" style="color:#ff7b72">0</b></span>
@@ -637,20 +894,43 @@ _PAGE = """<!doctype html>
   <span class="s">__WHO__</span>
   <a href="/auth/logout">sign out</a>
 </header>
-<div id="bar">
-  <label>min sev
-    <select id="fSev">
-      <option value="0">all</option><option value="9">info+</option><option value="10">notice+</option>
-      <option value="13">warning+</option><option value="17">error+</option><option value="18">crit+</option>
-    </select></label>
-  <input type="text" id="fSrc" placeholder="source filter (substr)">
-  <input type="text" id="fQ" placeholder="search text">
-  <label><input type="checkbox" id="cLog" checked> logs</label>
-  <label><input type="checkbox" id="cAlert" checked> alerts</label>
-  <label><input type="checkbox" id="cEval" checked> evals</label>
-  <span class="btn" id="clear">clear buffer</span>
-</div>
-<div id="wrap"></div>
+<section id="livePane">
+  <div id="bar">
+    <label>min sev
+      <select id="fSev">
+        <option value="0">all</option><option value="9">info+</option><option value="10">notice+</option>
+        <option value="13">warning+</option><option value="17">error+</option><option value="18">crit+</option>
+      </select></label>
+    <input type="text" id="fSrc" placeholder="source filter (substr)">
+    <input type="text" id="fQ" placeholder="search text">
+    <label><input type="checkbox" id="cLog" checked> logs</label>
+    <label><input type="checkbox" id="cAlert" checked> alerts</label>
+    <label><input type="checkbox" id="cEval" checked> evals</label>
+    <span class="btn" id="clear">clear buffer</span>
+  </div>
+  <div id="wrap"></div>
+</section>
+<section id="filtersPane" hidden>
+  <h2>Ingress filters</h2>
+  <div class="lead">First match wins. Matching lines are counted, then discarded before storage and alert evaluation.</div>
+  <div class="filter-editor">
+    <label>name<input id="ifName" maxlength="120" placeholder="routine service noise"></label>
+    <label>match<select id="ifType"><option value="substring">substring</option><option value="regex">RE2 regex</option></select></label>
+    <label class="wide">pattern<input id="ifPattern" maxlength="512" placeholder="literal message text"></label>
+    <label>order<input id="ifOrder" type="number" min="0" max="1000000" value="100"></label>
+    <label>source glob<input id="ifSource" maxlength="255" placeholder="optional: host*"></label>
+    <label>program glob<input id="ifProgram" maxlength="255" placeholder="optional: systemd"></label>
+    <label class="checks"><span><input id="ifCase" type="checkbox"> case-sensitive</span>
+      <span><input id="ifEnabled" type="checkbox" checked> enabled</span></label>
+    <div class="filter-actions">
+      <button class="action primary" id="ifSave">create filter</button>
+      <button class="action" id="ifPreview">preview history</button>
+      <button class="action" id="ifCancel" hidden>cancel edit</button>
+      <span id="filterNote"></span>
+    </div>
+  </div>
+  <div id="filterList"></div>
+</section>
 <div id="modal"><div class="box">
   <div class="hd"><b id="mTitle">semantic evaluation</b><span class="x" id="mClose">✕</span></div>
   <div class="bd" id="mBody"></div>
@@ -658,12 +938,128 @@ _PAGE = """<!doctype html>
 <script>
 (function(){
   var wrap=document.getElementById('wrap'), items=[], MAXI=2500, MAXD=1500, nlog=0,nalert=0,neval=0, seq=0;
+  var livePane=document.getElementById('livePane'), filtersPane=document.getElementById('filtersPane'),
+      tabLive=document.getElementById('tabLive'), tabFilters=document.getElementById('tabFilters'),
+      filterRows=[], editingFilter=null;
   // Real datetime in the VIEWER's timezone (server sends UTC epoch-ms in d.ts_ms).
   var TF=new Intl.DateTimeFormat(undefined,{year:'2-digit',month:'2-digit',day:'2-digit',
     hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
   function fmtTs(d){ return d.ts_ms==null ? (d.ts||'?') : TF.format(new Date(d.ts_ms)); }
   var elSev=document.getElementById('fSev'), elSrc=document.getElementById('fSrc'), elQ=document.getElementById('fQ'),
       cLog=document.getElementById('cLog'), cAlert=document.getElementById('cAlert'), cEval=document.getElementById('cEval');
+  var ifName=document.getElementById('ifName'),ifType=document.getElementById('ifType'),
+      ifPattern=document.getElementById('ifPattern'),ifOrder=document.getElementById('ifOrder'),
+      ifSource=document.getElementById('ifSource'),ifProgram=document.getElementById('ifProgram'),
+      ifCase=document.getElementById('ifCase'),ifEnabled=document.getElementById('ifEnabled'),
+      ifSave=document.getElementById('ifSave'),ifCancel=document.getElementById('ifCancel'),
+      filterNote=document.getElementById('filterNote'),filterList=document.getElementById('filterList');
+  function showTab(which){
+    var filters=which==='filters';
+    livePane.hidden=filters;filtersPane.hidden=!filters;
+    tabLive.className=filters?'':'on';tabFilters.className=filters?'on':'';
+    if(filters){location.hash='filters';loadFilters();}else if(location.hash==='#filters')history.replaceState(null,'',location.pathname);
+  }
+  tabLive.onclick=function(){showTab('live');};tabFilters.onclick=function(){showTab('filters');};
+  function api(url,opts){
+    opts=opts||{};opts.credentials='same-origin';opts.cache='no-store';
+    if(opts.body){opts.headers={'Content-Type':'application/json'};opts.body=JSON.stringify(opts.body);}
+    return fetch(url,opts).then(function(r){return r.text().then(function(t){
+      var d={};try{d=t?JSON.parse(t):{};}catch(_){d={error:t||('HTTP '+r.status)};}
+      if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d;
+    });});
+  }
+  function note(s,bad){filterNote.textContent=s||'';filterNote.style.color=bad?'#ff7b72':'var(--dim)';}
+  function filterSpec(row){
+    if(row)return{name:row.name,match_type:row.match_type,pattern:row.pattern,
+      source_glob:row.source_glob||'',program_glob:row.program_glob||'',
+      case_sensitive:!!row.case_sensitive,filter_order:Number(row.filter_order||0),enabled:!!row.enabled};
+    return{name:ifName.value.trim(),match_type:ifType.value,pattern:ifPattern.value,
+      source_glob:ifSource.value.trim(),program_glob:ifProgram.value.trim(),
+      case_sensitive:ifCase.checked,filter_order:Number(ifOrder.value||100),enabled:ifEnabled.checked};
+  }
+  function resetEditor(){
+    editingFilter=null;ifName.value='';ifType.value='substring';ifPattern.value='';ifOrder.value='100';
+    ifSource.value='';ifProgram.value='';ifCase.checked=false;ifEnabled.checked=true;
+    ifSave.textContent='create filter';ifCancel.hidden=true;note('');
+  }
+  function editFilter(row){
+    editingFilter=row.id;ifName.value=row.name;ifType.value=row.match_type;ifPattern.value=row.pattern;
+    ifOrder.value=row.filter_order;ifSource.value=row.source_glob||'';ifProgram.value=row.program_glob||'';
+    ifCase.checked=!!row.case_sensitive;ifEnabled.checked=!!row.enabled;
+    ifSave.textContent='save filter #'+row.id;ifCancel.hidden=false;note('editing '+row.name);
+    filtersPane.scrollIntoView({behavior:'smooth',block:'start'});
+  }
+  function button(label,cls,fn){
+    var b=document.createElement('button');b.className='action'+(cls?(' '+cls):'');
+    b.textContent=label;b.onclick=fn;return b;
+  }
+  function cell(cls,text){var d=document.createElement('div');d.className=cls;d.textContent=text;return d;}
+  function renderFilters(){
+    filterList.innerHTML='';
+    if(!filterRows.length){filterList.appendChild(cell('meta','no ingress filters'));return;}
+    filterRows.forEach(function(row){
+      var card=document.createElement('div');card.className='filter-card'+(row.enabled?'':' off');
+      card.appendChild(cell('ord','#'+row.filter_order));
+      var name=cell('','');name.appendChild(cell('fname',row.name));
+      name.appendChild(cell('meta',(row.enabled?'enabled':'disabled')+' · '+row.match_type+
+        (row.case_sensitive?' · case-sensitive':'')));card.appendChild(name);
+      var pat=cell('','');pat.appendChild(cell('pat',row.pattern));
+      var scopes=[];if(row.source_glob)scopes.push('source='+row.source_glob);
+      if(row.program_glob)scopes.push('program='+row.program_glob);
+      pat.appendChild(cell('meta',scopes.length?scopes.join(' · '):'all sources/programs'));card.appendChild(pat);
+      var last=row.last_matched?new Date(row.last_matched).toLocaleString():'never';
+      card.appendChild(cell('stats',Number(row.dropped||0).toLocaleString()+' dropped · last '+last));
+      var actions=cell('card-actions','');
+      actions.appendChild(button('edit','',function(){editFilter(row);}));
+      actions.appendChild(button(row.enabled?'disable':'enable','',function(){
+        var spec=filterSpec(row);spec.enabled=!row.enabled;
+        api('/api/filters/'+row.id,{method:'PUT',body:spec}).then(function(){note('updated '+row.name);loadFilters();})
+          .catch(function(e){note(e.message,true);});
+      }));
+      actions.appendChild(button('preview','',function(){
+        note('counting historical matches…');
+        api('/api/filters/preview',{method:'POST',body:filterSpec(row)}).then(function(d){
+          note(Number(d.would_match||0).toLocaleString()+' stored matches; showing '+(d.sample||[]).length+' samples');
+        }).catch(function(e){note(e.message,true);});
+      }));
+      actions.appendChild(button('purge','danger',function(){
+        var confirmation=prompt('This permanently deletes matching stored events in batches.\\nType the exact filter name to continue:\\n\\n'+row.name);
+        if(confirmation===null)return;
+        note('purging up to 50,000 matching rows…');
+        api('/api/filters/'+row.id+'/purge',{method:'POST',body:{confirm_name:confirmation,batch_size:50000}})
+          .then(function(d){note(Number(d.deleted||0).toLocaleString()+' rows deleted'+
+            (d.batch_limit_reached?' — repeat purge for the next batch.':' — no full batch remains.')+
+            ' PostgreSQL can reuse the freed pages after VACUUM.');loadFilters();})
+          .catch(function(e){note(e.message,true);});
+      }));
+      actions.appendChild(button('delete','danger',function(){
+        if(!confirm('Delete ingress filter \"'+row.name+'\"? Historical events are not deleted.'))return;
+        api('/api/filters/'+row.id,{method:'DELETE'}).then(function(){note('deleted '+row.name);resetEditor();loadFilters();})
+          .catch(function(e){note(e.message,true);});
+      }));
+      card.appendChild(actions);filterList.appendChild(card);
+    });
+  }
+  function loadFilters(){
+    api('/api/filters').then(function(d){filterRows=d.filters||[];renderFilters();})
+      .catch(function(e){note(e.message,true);});
+  }
+  ifSave.onclick=function(){
+    var url=editingFilter?('/api/filters/'+editingFilter):'/api/filters';
+    note(editingFilter?'saving…':'creating…');
+    api(url,{method:editingFilter?'PUT':'POST',body:filterSpec()}).then(function(){
+      var msg=editingFilter?'filter updated':'filter created';resetEditor();note(msg);loadFilters();
+    }).catch(function(e){note(e.message,true);});
+  };
+  document.getElementById('ifPreview').onclick=function(){
+    note('counting historical matches…');
+    api('/api/filters/preview',{method:'POST',body:filterSpec()}).then(function(d){
+      var sample=(d.sample||[]).slice(0,3).map(function(x){return x.source+' '+(x.program||'')+': '+x.body;});
+      note(Number(d.would_match||0).toLocaleString()+' stored matches'+
+        (sample.length?'\\n'+sample.join('\\n'):''));
+    }).catch(function(e){note(e.message,true);});
+  };
+  ifCancel.onclick=resetEditor;
   document.getElementById('clear').onclick=function(){items=[];wrap.innerHTML='';nlog=nalert=neval=0;counts();};
   // source / min-sev / search are filtered SERVER-SIDE (so the backfill returns the latest
   // matching rows, not the latest-N then client-filtered) -> reconnect the stream on change,
@@ -825,6 +1221,7 @@ _PAGE = """<!doctype html>
   }
   setInterval(keepalive, __PING_MS__);
   connect();
+  if(location.hash==='#filters')showTab('filters');
 })();
 </script>
 </body></html>

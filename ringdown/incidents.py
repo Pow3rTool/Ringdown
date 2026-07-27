@@ -18,7 +18,6 @@ The Dispatcher plugins stay pure "how to reach"; all of the above lives here.
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from collections import deque
 
@@ -147,7 +146,6 @@ class Coordinator:
             return
         fake_target = {"id": None, "type": "ntfy",
                        "config": {"topic": self._fallback_topic}}
-        title = f"Ringdown (no agent): {ctx.rule.get('name')} on {ctx.event.get('source')}"
         # public-safe: reason is our own text, summary is LLM-sanitized — never raw logs
         body = (f"[{ctx.event.get('severity_text') or '?'}] dispatch degraded: {reason[:120]}. "
                 f"Investigate in Ringdown (source {ctx.event.get('source')}).")

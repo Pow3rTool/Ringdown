@@ -299,6 +299,17 @@ CREATE TABLE IF NOT EXISTS alert_rules (
 CREATE INDEX IF NOT EXISTS alert_rules_enabled ON alert_rules (enabled, kind);
 CREATE INDEX IF NOT EXISTS alert_rules_owner   ON alert_rules (created_by);
 
+-- Durable acknowledgement cursor for L2 semantic windows. The collector creates
+-- a row lazily when it first sees a semantic rule and advances it only after the
+-- LLM returned a parsed verdict and any firing was dispatched. A failed request
+-- therefore leaves the same event range pending across retries and restarts.
+CREATE TABLE IF NOT EXISTS semantic_rule_state (
+    rule_id           bigint      PRIMARY KEY REFERENCES alert_rules(id) ON DELETE CASCADE,
+    last_event_id     bigint      NOT NULL,
+    last_evaluated_at timestamptz NOT NULL,
+    updated_at        timestamptz NOT NULL DEFAULT now()
+);
+
 -- --- rule -> target bindings (fan-out; per-binding router knobs) ----------
 CREATE TABLE IF NOT EXISTS rule_targets (
     rule_id       bigint      NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,

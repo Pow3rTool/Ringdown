@@ -61,6 +61,9 @@ tests/              test suite
   succeed.
 - **No raw bodies on shared channels.** Public/shared notification targets receive only a
   sanitized summary (rule, source, severity), never raw log lines.
+- **Durable semantic catch-up.** L2 windows are checkpointed per rule only after a successful
+  verdict. Inference failures retry with backoff and retained events are replayed oldest-first
+  after recovery, including across collector restarts.
 - **Configuration is external.** All secrets and host-specific settings come from the
   environment; nothing sensitive lives in the tree. See `.env.example`.
 

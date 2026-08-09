@@ -145,10 +145,10 @@ SEMANTIC_SPIKE = _i("RINGDOWN_SEMANTIC_SPIKE", 100)  # per-rule NEW-line burst -
 #    rules. Excess rules defer to the next tick (still floor-gated). 0 disables.
 SEMANTIC_MIN_INTERVAL = _f("RINGDOWN_SEMANTIC_MIN_INTERVAL", 300)
 SEMANTIC_MAX_PER_MIN = _i("RINGDOWN_SEMANTIC_MAX_PER_MIN", 20)
-# LLM-outage heartbeat: if the judge backend is unreachable continuously for this
-# long, push ONE ntfy notice (never repeated until it recovers, then one recovery
-# notice). Long by design — planned rig shutdowns (storms) shouldn't page instantly.
-# 0 disables. Note: a collector restart resets the downtime clock.
+# LLM-outage heartbeat: alert on the first failed inference, then repeat at most
+# once per this interval while failures continue. A successful inference after a
+# notified outage sends one recovery notice. 0 disables. In-memory notification
+# timing resets with the collector; durable semantic window checkpoints do not.
 SEMANTIC_OUTAGE_ALERT_S = _f("RINGDOWN_SEMANTIC_OUTAGE_ALERT_S", 86400)  # 24h
 
 # --- MCP control-plane front door (Entra bearer) -----------------------------

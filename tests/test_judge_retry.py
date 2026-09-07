@@ -108,8 +108,9 @@ async def test_failed_window_is_retried_before_checkpoint_advances(monkeypatch):
     judge._last[7] = 0
     judge._rules_with_targets = lambda: _async_value([_rule()])
     results = iter([
-        (None, "ConnectError", "", False, 2),
-        ({"fire": False, "why": "quiet"}, '{"fire":false}', "", True, 3),
+        (None, '{"fire":', "", True, False, 2),
+        ({"fire": False, "severity": "info", "why": "quiet"},
+         '{"fire":false,"severity":"info","why":"quiet"}', "", True, True, 3),
     ])
 
     async def fake_llm(_condition, _summary):
@@ -126,6 +127,7 @@ async def test_failed_window_is_retried_before_checkpoint_advances(monkeypatch):
     await judge._eval()
     assert judge._seen[7] == 0
     assert checkpoints == []
+    assert coord.notices == []
 
     judge._retry_after[7] = 0
     await judge._eval()
@@ -162,7 +164,9 @@ async def test_catchup_reads_oldest_batches_without_skipping(monkeypatch):
     judge._rules_with_targets = lambda: _async_value([_rule()])
 
     async def successful_llm(_condition, _summary):
-        return {"fire": False, "why": "quiet"}, '{"fire":false}', "", True, 1
+        return ({"fire": False, "severity": "info", "why": "quiet"},
+                '{"fire":false,"severity":"info","why":"quiet"}',
+                "", True, True, 1)
 
     judge._judge_llm = successful_llm
     judge._trace = _noop

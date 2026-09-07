@@ -30,23 +30,62 @@ from .dispatch import FireContext
 from .syslog_parse import SEV_NUM
 
 
+# The same verdict schema serves two independent purposes:
+#   * response_format asks compatible providers (including vLLM) to constrain
+#     generation; Nexus forwards this standard OpenAI field.
+#   * nexus_schema asks Nexus to observe and classify the completed response;
+#     Nexus consumes these private fields before provider dispatch.
+# Ringdown still owns verdict validation, retry, and checkpoint behavior.
+VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "fire": {"type": "boolean"},
+        "severity": {"type": "string", "enum": ["info", "warn", "crit"]},
+        "why": {"type": "string"},
+    },
+    "required": ["fire", "severity", "why"],
+    "additionalProperties": False,
+}
+
+VERDICT_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "ringdown_verdict",
+        "strict": True,
+        "schema": VERDICT_SCHEMA,
+    },
+}
+
+
 def _extract_verdict(text: str):
     """Pull the {fire,severity,why} JSON out of a model reply. Robust to reasoning
     models that wrap/precede it with prose or <think> blocks: prefer the LAST flat
     JSON object that mentions "fire" (they tend to restate the final verdict), then
     fall back to a greedy outer-object match. Returns None if nothing parses (which
     the caller treats as no-fire)."""
+    def valid(value):
+        return (
+            isinstance(value, dict)
+            and set(value) == {"fire", "severity", "why"}
+            and isinstance(value["fire"], bool)
+            and value["severity"] in {"info", "warn", "crit"}
+            and isinstance(value["why"], str)
+        )
+
     text = text or ""
     for chunk in reversed(re.findall(r"\{[^{}]*\}", text, re.S)):
         if "fire" in chunk:
             try:
-                return json.loads(chunk)
+                value = json.loads(chunk)
+                if valid(value):
+                    return value
             except Exception:
                 continue
     m = re.search(r"\{.*\}", text, re.S)
     if m:
         try:
-            return json.loads(m.group(0))
+            value = json.loads(m.group(0))
+            return value if valid(value) else None
         except Exception:
             return None
     return None
@@ -284,8 +323,12 @@ class SemanticJudge:
             trigger = "spike" if cnt >= spike else "interval"
             summary = self._summarize(evs)
             top = Counter(e["source"] for e in evs).most_common(1)[0][0]
-            verdict, raw, reasoning, ok, ms = await self._judge_llm(r["pattern"], summary)
-            await self._track_llm_health(ok)
+            verdict, raw, reasoning, transport_ok, ok, ms = await self._judge_llm(
+                r["pattern"], summary)
+            # Provider reachability and response-shape health are separate. A
+            # malformed verdict retains/retries the window but must not announce
+            # that the backend itself is unavailable.
+            await self._track_llm_health(transport_ok)
             fired = bool(verdict and verdict.get("fire"))
             sevt = str(verdict.get("severity", "warn")) if fired else None
             # Trace EVERY evaluation (fired or not) so the WebUI can show what the
@@ -340,12 +383,12 @@ class SemanticJudge:
         return "\n".join(lines)[:8000]
 
     async def _judge_llm(self, condition: str, summary: str):
-        """Run the judge model. Returns (verdict|None, content, reasoning, ok, latency_ms):
+        """Run the judge model. Returns
+        (verdict|None, content, reasoning, transport_ok, output_ok, latency_ms):
         `content` is the model's answer reply (or the error string) that we parse the
-        verdict from; `reasoning` is the separate reasoning_content trace (empty if the
-        model isn't a reasoning model). ok is True only when the call succeeded AND a
-        verdict parsed — a successful call whose reply won't parse is ok=False with the
-        content kept, which is precisely the case worth inspecting in the UI."""
+        verdict from; `reasoning` is the separate reasoning trace (empty if the model
+        isn't a reasoning model). transport_ok records backend reachability, while
+        output_ok requires a complete, schema-valid verdict."""
         sysp = ("You are an alert judge for a log-monitoring system. Given a rule CONDITION and a "
                 "WINDOW summary of device log activity, decide whether the condition is currently met. "
                 'Answer with ONLY a JSON object: {"fire": <true|false>, "severity": "info|warn|crit", '
@@ -357,7 +400,9 @@ class SemanticJudge:
         # ample headroom). Temperature is sent ONLY if pinned in config; otherwise omit
         # it so vLLM applies the model's own generation_config recipe (temp=0 looped).
         payload = {"model": config.LLM_MODEL, "max_tokens": config.LLM_MAX_TOKENS,
-                   "messages": [{"role": "system", "content": sysp}, {"role": "user", "content": usr}]}
+                   "messages": [{"role": "system", "content": sysp}, {"role": "user", "content": usr}],
+                   "response_format": VERDICT_RESPONSE_FORMAT,
+                   "nexus_schema_kind": "json_schema", "nexus_schema": VERDICT_SCHEMA}
         if config.LLM_TEMPERATURE is not None:
             payload["temperature"] = config.LLM_TEMPERATURE
         t0 = time.monotonic()
@@ -367,21 +412,29 @@ class SemanticJudge:
                 headers=({"Authorization": f"Bearer {config.LLM_API_KEY}"} if config.LLM_API_KEY else {}),
                 json=payload)
             r.raise_for_status()
+        except Exception as e:
+            ms = int((time.monotonic() - t0) * 1000)
+            print(f"[judge] llm failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            return None, f"{type(e).__name__}: {e}", "", False, False, ms
+        try:
             msg = r.json()["choices"][0].get("message", {})
             # Reasoning models return the thinking SEPARATELY in `reasoning_content`
             # and the answer in `content`. Keep them apart: `content` is the reply we
             # parse the verdict from (raw); `reasoning` is the trace, stored on its own.
             # Parse from content, but fall back to reasoning for the verdict if content
             # is empty (some models emit the JSON only inside reasoning_content).
-            content = (msg.get("content") or "").strip()
-            reasoning = (msg.get("reasoning_content") or "").strip()
+            content_value = msg.get("content")
+            reasoning_value = msg.get("reasoning_content") or msg.get("reasoning")
+            content = content_value.strip() if isinstance(content_value, str) else ""
+            reasoning = reasoning_value.strip() if isinstance(reasoning_value, str) else ""
             ms = int((time.monotonic() - t0) * 1000)
             verdict = _extract_verdict(content or reasoning)
-            return verdict, content, reasoning, verdict is not None, ms
+            return verdict, content, reasoning, True, verdict is not None, ms
         except Exception as e:
             ms = int((time.monotonic() - t0) * 1000)
-            print(f"[judge] llm failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-            return None, f"{type(e).__name__}: {e}", "", False, ms
+            print(f"[judge] llm response invalid: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+            return None, f"{type(e).__name__}: {e}", "", True, False, ms
 
     async def _trace(self, rule_id, source, trigger, from_id, to_id, n, elapsed,
                      fired, severity, why, ok, ms, summary, raw, reasoning) -> None:

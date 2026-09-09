@@ -38,6 +38,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from . import config
+from .event_attrs import visible_attributes
 from .filters import (
     FilterValidationError,
     compile_regex,
@@ -408,13 +409,16 @@ async def search_logs(ctx: Context, source: str = "", contains: str = "", regex:
     if until is not None:
         where.append("ts <= to_timestamp(%s)"); params.append(until)
     lim = min(int(limit) if limit and limit > 0 else config.DEFAULT_LIMIT, config.MAX_LIMIT)
-    sql = ("SELECT id, ts, source, severity, severity_text, program, body, template_id FROM events"
+    sql = ("SELECT id, ts, source, severity, severity_text, program, body, attributes, "
+           "template_id FROM events"
            + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY ts DESC LIMIT %s")
     params.append(lim)
     try:
         rows = await _fetch(sql, params)
     except Exception as e:
         return _err(f"query failed: {type(e).__name__}: {str(e)[:200]}")
+    for row in rows:
+        row["attributes"] = visible_attributes(row.get("attributes"))
     return _out({"count": len(rows), "limit": lim, "events": rows})
 
 
@@ -451,10 +455,13 @@ async def timeline(ctx: Context, since_iso: str = "", since_seconds: float = 0.0
     try:
         summary = await _fetch("SELECT source, count(*) AS events, max(severity) AS worst FROM events"
                                + wsql + " GROUP BY source ORDER BY events DESC", params)
-        events = await _fetch("SELECT id, ts, source, severity, severity_text, program, body FROM events"
+        events = await _fetch("SELECT id, ts, source, severity, severity_text, program, body, "
+                              "attributes FROM events"
                               + wsql + " ORDER BY ts ASC LIMIT %s", params + [lim])
     except Exception as e:
         return _err(f"query failed: {type(e).__name__}: {str(e)[:200]}")
+    for event in events:
+        event["attributes"] = visible_attributes(event.get("attributes"))
     return _out({"by_source": summary, "count": len(events), "events": events})
 
 

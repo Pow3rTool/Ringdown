@@ -47,6 +47,7 @@ from starlette.responses import (
 from starlette.routing import Route
 
 from . import config, db
+from .event_attrs import visible_attributes
 from .filters import (
     FilterValidationError,
     get_filter,
@@ -327,7 +328,8 @@ def _ms(ts):
 def _logitem(r: dict) -> dict:
     return {"t": "log", "ts": _iso(r["ts"]), "ts_ms": _ms(r["ts"]), "source": r["source"],
             "sev": r.get("severity_text"), "sevnum": r.get("severity") or 0,
-            "prog": r.get("program"), "body": r.get("body")}
+            "prog": r.get("program"), "body": r.get("body"),
+            "attrs": visible_attributes(r.get("attributes"))}
 
 
 def _alertitem(r: dict) -> dict:
@@ -590,7 +592,7 @@ async def stream(request):
         last_ev = last_al = last_se = 0
         # --- backfill the enabled kinds (latest-N matching rows, emitted oldest-first) ---
         if "log" in kinds:
-            back = await db.fetch(pool, "SELECT id, ts, source, severity, severity_text, program, body "
+            back = await db.fetch(pool, "SELECT id, ts, source, severity, severity_text, program, body, attributes "
                                         "FROM events" + back_where + " ORDER BY id DESC LIMIT %s",
                                   fp + [lim])
             last_ev = back[0]["id"] if back else 0
@@ -627,7 +629,7 @@ async def stream(request):
                     break
             pe, pa, ps = last_ev, last_al, last_se   # cursor snapshot (did we send anything?)
             if "log" in kinds:
-                evs = await db.fetch(pool, "SELECT id, ts, source, severity, severity_text, program, body "
+                evs = await db.fetch(pool, "SELECT id, ts, source, severity, severity_text, program, body, attributes "
                                            "FROM events WHERE id > %s" + ev_where
                                            + " ORDER BY id LIMIT 500", [last_ev] + fp)
                 for r in evs:
@@ -851,6 +853,7 @@ _PAGE = """<!doctype html>
   }
   .row{padding:1px 14px;white-space:pre-wrap;word-break:break-word;border-left:3px solid transparent}
   .row .ts{color:var(--dim)} .row .src{color:#79c0ff} .row .prog{color:#a5d6ff}
+  .row .attrs{color:#c297ff;font-size:11px}
   .sev-err,.sev-crit,.sev-alert,.sev-emerg{color:#ff7b72}
   .sev-warning,.sev-warn{color:#d29922}
   .sev-notice{color:#58a6ff} .sev-info,.sev-debug{color:#8b949e}
@@ -1083,7 +1086,7 @@ _PAGE = """<!doctype html>
       var src=(elSrc.value||'').toLowerCase(); if(src && (''+(d.source||'')).toLowerCase().indexOf(src)<0) return false;
     }
     var q=(elQ.value||'').toLowerCase();
-    if(q){ var hay=[d.source,d.prog,d.body,d.rule,d.disp,d.why].join(' ').toLowerCase(); if(hay.indexOf(q)<0) return false; }
+    if(q){ var hay=[d.source,d.prog,d.body,d.rule,d.disp,d.why,JSON.stringify(d.attrs||{})].join(' ').toLowerCase(); if(hay.indexOf(q)<0) return false; }
     return true;
   }
   function el(cls,txt){var s=document.createElement('span');if(cls)s.className=cls;s.textContent=txt;return s;}
@@ -1118,6 +1121,11 @@ _PAGE = """<!doctype html>
     if(d.sev)r.appendChild(el('','['+d.sev+'] '));
     if(d.prog)r.appendChild(el('prog',d.prog+': '));
     r.appendChild(el('',d.body||''));
+    var attrKeys=Object.keys(d.attrs||{});
+    if(attrKeys.length){
+      var detail=attrKeys.map(function(k){return k+'='+d.attrs[k];}).join(' · ');
+      r.appendChild(el('attrs',' ['+detail+']'));
+    }
     return r;
   }
   // `items` is kept sorted NEWEST-FIRST by (ts_ms, arrival seq) so the three

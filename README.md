@@ -16,14 +16,16 @@ Two long-running processes share one Postgres database and never talk directly �
 at the DB (rows plus `LISTEN/NOTIFY`):
 
 ```
-syslog (UDP/TCP 514) → collector → ingress filters → Postgres ← control plane
+syslog (UDP/TCP 514) ─┐
+                      ├→ collector → ingress filters → Postgres ← control plane
+OTLP/HTTP JSON (4318) ┘
                                               │         ↑       operators / agents
                                               │ match rules     (CRUD filters/rules/targets;
                                               ▼                  triggers NOTIFY)
                      dispatch → pluggable targets (human push, agent hand-off, …)
 ```
 
-- **`ringdown.collector`** — the hot path: ingest syslog, normalize, discard centrally managed
+- **`ringdown.collector`** — the hot path: ingest syslog and OTLP logs, normalize, discard centrally managed
   routine noise, template-mine and store accepted events, match the in-memory ruleset, and
   dispatch. Filter/rule sets refresh on Postgres `NOTIFY`, not per line. An optional LLM-judged
   loop handles signals that plain rules miss.
@@ -80,6 +82,21 @@ pytest -q
 
 See `deploy/` for the systemd units and `.env.example` for the full list of configuration
 options.
+
+The collector accepts standard OTLP/HTTP JSON log exports at `POST /v1/logs`.
+Ingress is fail-closed to `RINGDOWN_OTLP_ALLOWED_CIDRS`, uses the socket peer
+address (never forwarding headers), and shares syslog's bounded queue, filters,
+storage, and routing path. Defaults allow only IPv4 and IPv6 loopback. Configure
+your trusted exporter subnets explicitly in the deployment environment; private
+address space is not implicitly trusted. This is network trust, not workload
+identity; use TLS client authentication when exposing the listener beyond a
+trusted network. Protobuf OTLP is not enabled yet, so exporters must select the
+OTLP/HTTP JSON protocol.
+
+The complete OTLP attribute map remains stored for database forensics. Rules,
+the semantic judge, MCP search results, and the WebUI expose only a bounded
+allowlist of operational application and Netdata fields so arbitrary exporter data is
+not promoted into alerts or agent context.
 
 Re-apply `ringdown/schema.sql` before deploying a version that introduces schema changes:
 

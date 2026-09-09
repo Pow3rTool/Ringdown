@@ -1,0 +1,20 @@
+# Netdata custom notification bridge to Ringdown.
+# Keep the default disabled so only explicitly mapped roles are exported.
+SEND_EMAIL="NO"
+SEND_CUSTOM="YES"
+DEFAULT_RECIPIENT_CUSTOM="disabled"
+role_recipients_custom[sysadmin]="ringdown"
+
+# Replace the example hostname with your collector's address.
+RINGDOWN_NETDATA_OTLP_ENDPOINT="http://collector.example.test:4318/v1/logs"
+
+custom_sender() {
+    [ "${1:-}" = "ringdown" ] || return 1
+    RINGDOWN_OTLP_ENDPOINT="${RINGDOWN_NETDATA_OTLP_ENDPOINT}" \
+        /usr/local/libexec/netdata_ringdown_otlp.py \
+        "${roles:-}" "${host:-}" "${name:-}" "${chart:-}" \
+        "${status:-}" "${old_status:-}" "${value:-}" "${units:-}" \
+        "${classification:-}" "${context:-}" "${component:-}" "${type:-}" \
+        "${alarm_id:-}" "${event_id:-}" "${transition_id:-}" "${when:-}" \
+        "${value_string:-}"
+}

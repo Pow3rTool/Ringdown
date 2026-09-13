@@ -264,6 +264,11 @@ class AgentQueue:
             await conn.execute("UPDATE agent_workstreams SET attempted=true,status='uncertain' WHERE handle=%s",
                                (ws["handle"],))
             res = await disp.open(replace(ctx, request_id=ws["handle"]), target)
+            await conn.execute(
+                "INSERT INTO audit(actor_oid,action,detail) VALUES ('collector','agent_create',%s)",
+                (Jsonb({"rule_id": rule["id"], "target_id": target["id"],
+                        "reserved_handle": ws["handle"], "returned_handle": res.handle,
+                        "ok": res.ok, "detail": res.detail[:300]}),))
             if not res.ok:
                 if res.meta.get("retry_create"):
                     await conn.execute("UPDATE agent_workstreams SET attempted=false,status='opening' WHERE handle=%s",

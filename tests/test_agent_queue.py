@@ -6,7 +6,6 @@ import asyncio
 import os
 import secrets
 from dataclasses import replace
-from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg
@@ -73,8 +72,16 @@ async def test_create_reserves_id_without_triggering_initial_message():
     disp = TurnstoneDispatcher(http, FakeAdmin(), base_url="http://ts")
     result = await disp.open(replace(_ctx(owner="alice"), request_id="reserved"), {})
     assert result.ok
-    assert http.calls[0]["url"].endswith("?ws_id=reserved")
+    assert http.calls[0]["url"] == "http://ts/v1/api/route/workstreams/new"
+    assert http.calls[0]["json"]["ws_id"] == "reserved"
     assert "initial_message" not in http.calls[0]["json"]
+
+
+def test_workstream_name_preserves_durable_timestamp():
+    ctx = _ctx()
+    expected = TurnstoneDispatcher._ws_name(ctx)
+    restored = replace(ctx, event={**ctx.event, "ts": ctx.event["ts"].isoformat()})
+    assert TurnstoneDispatcher._ws_name(restored) == expected
 
 
 class FakeAgent(Dispatcher):
@@ -261,7 +268,7 @@ async def test_closing_resolves_old_backlog_but_not_new_events(queue_db):
     await q.enqueue(event(), {"id": 2, "type": "turnstone"})
     await q.tick()
     await q.enqueue(event(), {"id": 2, "type": "turnstone"})
-    agent.closed_at = datetime.now(timezone.utc).isoformat()
+    agent.closed_at = (await db.fetchone(queue_db, "SELECT clock_timestamp() AS t"))["t"].isoformat()
     agent.states[agent.created[0]] = "closed"
     await ready(queue_db)
     await q.tick()
@@ -278,7 +285,7 @@ async def test_post_close_arrival_before_poll_is_not_discarded(queue_db):
     q = AgentQueue(queue_db, {"turnstone": agent}, feed_interval=0)
     await q.enqueue(event(), {"id": 2, "type": "turnstone"})
     await q.tick()
-    agent.closed_at = datetime.now(timezone.utc).isoformat()
+    agent.closed_at = (await db.fetchone(queue_db, "SELECT clock_timestamp() AS t"))["t"].isoformat()
     agent.states[agent.created[0]] = "closed"
     await q.enqueue(event(), {"id": 2, "type": "turnstone"})
     await ready(queue_db)

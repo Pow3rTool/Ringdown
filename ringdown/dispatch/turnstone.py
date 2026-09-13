@@ -67,7 +67,9 @@ class TurnstoneDispatcher(Dispatcher):
         ws_id = ctx.request_id or secrets.token_hex(16)
         # Send the seed separately, after durably recording the handle. A
         # refused/ambiguous send must not spawn another chat.
-        body: dict = {"name": self._ws_name(ctx), "kind": "interactive"}
+        # JSON create takes ws_id in the BODY. The query parameter is only
+        # honored by the multipart route; using it here generates a fresh id.
+        body: dict = {"ws_id": ws_id, "name": self._ws_name(ctx), "kind": "interactive"}
         # Fail-closed defaults: blanket auto-approve is NEVER honored (it's refused
         # at target registration too — defense in depth against a directly-edited
         # DB row). Only a scoped tool list may relax the human-approval gate.
@@ -91,7 +93,7 @@ class TurnstoneDispatcher(Dispatcher):
             body["project_id"] = project_id
         try:
             r = await self._http.post(
-                f"{self._base}/v1/api/route/workstreams/new?ws_id={ws_id}",
+                f"{self._base}/v1/api/route/workstreams/new",
                 headers={"Authorization": f"Bearer {token}"}, json=body)
             if r.status_code == 409:
                 return DispatchResult(ok=False, handle=ws_id, detail="create id already exists; reconcile",
@@ -182,8 +184,14 @@ class TurnstoneDispatcher(Dispatcher):
     @staticmethod
     def _ws_name(ctx: FireContext) -> str:
         import re
+        from datetime import datetime
         slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", ctx.rule.get("name") or "")[:32]
         ev = ctx.event
         ts = ev.get("ts")
+        if isinstance(ts, str):
+            try:
+                ts = datetime.fromisoformat(ts)
+            except ValueError:
+                ts = None
         iso = ts.strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(ts, "strftime") else "?"
         return f"ringdown/{ev.get('source')}/{ev.get('severity_text') or '?'}/{slug}/{iso}"

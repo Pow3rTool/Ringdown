@@ -26,6 +26,7 @@ def main() -> None:
         # schema's intentionally multi-statement SQL. The connection context
         # commits all DDL/data migrations together or rolls everything back.
         conn.execute(sql, prepare=False)
+        conn.execute(schema_path.with_name("agent_schema.sql").read_text(encoding="utf-8"), prepare=False)
     print("[ringdown-migrate] schema applied successfully", flush=True)
 
 

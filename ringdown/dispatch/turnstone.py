@@ -3,8 +3,8 @@
 The reference stateful/authenticated dispatcher. On a fresh
 incident it opens ONE Turnstone workstream **as the hook's owner** (via the
 owner-OBO bridge in :mod:`ringdown.obo`) seeded with the compact triage context;
-repeat matches feed that same workstream instead of spawning new ones. When the
-workstream is gone (404/410) it reports `gone` so the coordinator reopens.
+repeat matches feed that same workstream instead of spawning new ones. A
+metadata-only lifecycle read confirms closure; send 404/410 alone is not proof.
 
 Security posture (fail-closed — this summons an agent that can act):
   * Runs as the OWNER's identity, so every action is attributable + least-priv.
@@ -21,6 +21,7 @@ Security posture (fail-closed — this summons an agent that can act):
 from __future__ import annotations
 
 import secrets
+from dataclasses import replace
 
 from ..obo import TurnstoneAdmin
 from .base import Dispatcher, DispatchResult, FireContext
@@ -54,16 +55,19 @@ class TurnstoneDispatcher(Dispatcher):
         owner = await self._owner(ctx)
         if not owner:
             # No resolvable identity -> we will NOT run as a wrong/blank identity.
-            return DispatchResult(ok=False, detail="no resolvable owner for the rule (fail-closed)")
+            return DispatchResult(ok=False, detail="no resolvable owner for the rule (fail-closed)",
+                                  meta={"retry_create": True})
         cfg = target.get("config") or {}
         try:
             token = await self._admin.token_for(owner)
         except Exception as e:
-            return DispatchResult(ok=False, detail=f"owner-token mint failed: {type(e).__name__}: {str(e)[:160]}")
+            return DispatchResult(ok=False, detail=f"owner-token mint failed ({type(e).__name__})",
+                                  meta={"retry_create": True})
 
-        ws_id = secrets.token_hex(16)
-        body: dict = {"name": self._ws_name(ctx), "kind": "interactive",
-                      "initial_message": ctx.seed}
+        ws_id = ctx.request_id or secrets.token_hex(16)
+        # Send the seed separately, after durably recording the handle. A
+        # refused/ambiguous send must not spawn another chat.
+        body: dict = {"name": self._ws_name(ctx), "kind": "interactive"}
         # Fail-closed defaults: blanket auto-approve is NEVER honored (it's refused
         # at target registration too — defense in depth against a directly-edited
         # DB row). Only a scoped tool list may relax the human-approval gate.
@@ -89,9 +93,18 @@ class TurnstoneDispatcher(Dispatcher):
             r = await self._http.post(
                 f"{self._base}/v1/api/route/workstreams/new?ws_id={ws_id}",
                 headers={"Authorization": f"Bearer {token}"}, json=body)
+            if r.status_code == 409:
+                return DispatchResult(ok=False, handle=ws_id, detail="create id already exists; reconcile",
+                                      meta={"ambiguous": True})
+            if 400 <= r.status_code < 500:
+                return DispatchResult(ok=False, handle=ws_id,
+                                      detail=f"create refused (HTTP {r.status_code})",
+                                      meta={"retry_create": True})
             r.raise_for_status()
         except Exception as e:
-            return DispatchResult(ok=False, detail=f"create failed: {type(e).__name__}: {str(e)[:160]}")
+            return DispatchResult(ok=False, handle=ws_id,
+                                  detail=f"create outcome unknown ({type(e).__name__}); reconcile",
+                                  meta={"ambiguous": True})
         ws_id = (r.json() or {}).get("ws_id", ws_id) or ws_id
         return DispatchResult(ok=True, handle=ws_id, detail=f"opened ws {ws_id} as {owner}",
                               meta={"project_id": project_id})
@@ -105,16 +118,66 @@ class TurnstoneDispatcher(Dispatcher):
             r = await self._http.post(
                 f"{self._base}/v1/api/route/workstreams/{handle}/send",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"message": ctx.follow_up or ctx.seed})
+                json={"message": ctx.follow_up or ctx.seed,
+                      **({"client_send_id": ctx.delivery_id} if ctx.delivery_id else {})})
         except Exception as e:
-            return DispatchResult(ok=False, detail=f"feed failed: {type(e).__name__}: {str(e)[:160]}")
+            return DispatchResult(ok=False, detail=f"feed outcome unknown ({type(e).__name__})")
         if r.status_code in (404, 410):
             return DispatchResult(ok=False, gone=True, detail=f"ws {handle} gone ({r.status_code})")
         try:
             r.raise_for_status()
+        except Exception:
+            return DispatchResult(ok=False, detail=f"feed refused (HTTP {r.status_code})")
+        status = (r.json() or {}).get("status")
+        if status not in ("ok", "queued"):
+            return DispatchResult(ok=False, handle=handle,
+                                  detail=f"send not accepted ({status or 'unknown response'})",
+                                  meta={"send_status": status})
+        return DispatchResult(ok=True, handle=handle, detail=f"send accepted ({status})",
+                              meta={"send_status": status, "queued_messages": None})
+
+    async def prepare(self, ctx: FireContext, target: dict) -> FireContext:
+        owner = await self._owner(ctx)
+        if not owner:
+            raise ValueError("no resolvable owner for the rule (fail-closed)")
+        project = (ctx.rule.get("project_id") or target.get("project_id")
+                   or self._default_project or "")
+        return replace(ctx, owner_user=owner, rule={**ctx.rule, "project_id": project})
+
+    async def inspect(self, ctx: FireContext, target: dict, handle: str) -> DispatchResult:
+        # NOT /route/.../detail: that endpoint can rehydrate a CLOSED chat!
+        # This metadata-only endpoint needs admin.cluster.inspect on the owner
+        # token. 403/404 are UNKNOWN (404 can mask private-project tenancy).
+        try:
+            owner = await self._owner(ctx)
+            if not owner:
+                return DispatchResult(ok=False, detail="no inspection identity")
+            token = await self._admin.token_for(owner)
+            r = await self._http.get(
+                f"{self._base}/v1/api/cluster/ws/{handle}/detail?limit=0",
+                headers={"Authorization": f"Bearer {token}"})
+            if r.status_code != 200:
+                return DispatchResult(ok=False, handle=handle,
+                                      detail=f"lifecycle unknown (HTTP {r.status_code})")
+            data = r.json()
+            persisted = data.get("persisted") or {}
+            live = data.get("live") or {}
+            if persisted.get("user_id") != owner:
+                return DispatchResult(ok=False, handle=handle, detail="workstream owner mismatch")
+            if persisted.get("ws_id") != handle:
+                return DispatchResult(ok=False, handle=handle, detail="workstream identity mismatch")
+            state = live.get("state") or persisted.get("state")
+            if not state:
+                return DispatchResult(ok=False, handle=handle, detail="lifecycle state missing")
+            return DispatchResult(ok=True, handle=handle, gone=state in ("closed", "deleted"),
+                                  detail=f"workstream {state}", meta={
+                                      "state": state, "live": bool(live),
+                                      "project_id": persisted.get("project_id") or "",
+                                      "closed_at": persisted.get("updated") if state in ("closed", "deleted") else None,
+                                      "queued_messages": None})
         except Exception as e:
-            return DispatchResult(ok=False, detail=f"feed failed: {type(e).__name__}: {str(e)[:160]}")
-        return DispatchResult(ok=True, handle=handle, detail=f"fed ws {handle}")
+            return DispatchResult(ok=False, handle=handle,
+                                  detail=f"lifecycle unknown ({type(e).__name__})")
 
     @staticmethod
     def _ws_name(ctx: FireContext) -> str:

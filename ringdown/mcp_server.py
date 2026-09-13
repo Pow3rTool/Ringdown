@@ -890,11 +890,29 @@ async def delete_target(ctx: Context, target_id: int) -> str:
 
 # === rule CRUD ===============================================================
 @mcp.tool()
+async def dispatch_status(ctx: Context) -> str:
+    """Show active incident workstreams and Ringdown's durable waiting-event backlog.
+
+    Includes capacity, last lifecycle checks, waiting reasons and per-group
+    counts. Turnstone's own queue depth is UNKNOWN (null), not a guessed zero.
+    No raw event bodies or target credentials are returned.
+    """
+    ident = _auth(ctx)
+    if ident is None:
+        return _err("unauthenticated: bearer failed validation")
+    ok, why = _authz(ident, write=False)
+    if not ok:
+        return _err(why)
+    from .agent_queue import queue_status
+    return _out(await queue_status(_pool, config.MAX_ACTIVE_WORKSTREAMS))
+
+
+@mcp.tool()
 async def register_alert(ctx: Context, name: str, kind: str, pattern: str, instructions: str = "",
                          source_glob: str = "", min_severity: int = 0, window_kind: str = "sliding",
                          window_seconds: int = 300, spike_lines: int = 0, cooldown_seconds: int = 300,
                          rule_order: int = 100, stop_on_match: bool = False, project_id: str = "",
-                         targets: str = "") -> str:
+                         targets: str = "", group_by: str = "host") -> str:
     """Register an alert hook (needs Ringdown.Write). REQUIRED: name, kind, pattern.
       • kind='regex'    — RE2 `pattern` matched on every accepted incoming line (L1, cheap).
       • kind='semantic' — `pattern` is a PLAIN-ENGLISH condition an LLM judges over windows (L2).
@@ -902,6 +920,7 @@ async def register_alert(ctx: Context, name: str, kind: str, pattern: str, instr
       • source_glob     — restrict to devices ('rtr*'); min_severity — OTel floor (>=).
       • window_kind/window_seconds/spike_lines — L2 windowing (sliding|tumbling).
       • rule_order/stop_on_match — router order (lower first) + terminal-stop (pf `quick`).
+      • group_by — 'host' (default): one incident per host; 'rule': group all matching hosts.
       • project_id      — turnstone project this alert's chats are filed under. OPTIONAL: leave empty and
                           it inherits the target's project, else the deployment default
                           (RINGDOWN_TURNSTONE_DEFAULT_PROJECT). Set it only to override. You (the caller)
@@ -919,6 +938,8 @@ async def register_alert(ctx: Context, name: str, kind: str, pattern: str, instr
         return _err(why)
     if kind not in ("regex", "semantic"):
         return _err("kind must be 'regex' or 'semantic'.")
+    if group_by not in ("host", "rule"):
+        return _err("group_by must be 'host' or 'rule'.")
     if not (name and pattern):
         return _err("name and pattern are required.")
     if window_kind not in ("sliding", "tumbling"):
@@ -954,18 +975,19 @@ async def register_alert(ctx: Context, name: str, kind: str, pattern: str, instr
         row = await _exec(
             "INSERT INTO alert_rules (name, kind, pattern, instructions, source_glob, min_severity, "
             "window_kind, window_seconds, spike_lines, cooldown_seconds, rule_order, stop_on_match, "
-            "project_id, created_by, created_by_upn, created_by_bot) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            "project_id, created_by, created_by_upn, created_by_bot, group_by) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (name, kind, pattern, instructions or None, source_glob or None, int(min_severity) or None,
              window_kind, int(window_seconds), int(spike_lines) or None, int(cooldown_seconds),
-             int(rule_order), bool(stop_on_match), project_id or None, ident.oid, ident.upn, ident.appid))
+             int(rule_order), bool(stop_on_match), project_id or None, ident.oid, ident.upn, ident.appid, group_by))
     except Exception as e:
         return _err(f"insert failed: {type(e).__name__}: {str(e)[:200]}")
     for tid in tids:
         await _exec("INSERT INTO rule_targets (rule_id, target_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                     (row["id"], tid))
     await _audit(ident, "register_alert", {"id": row["id"], "name": name, "kind": kind, "targets": tids}, True)
-    result = {"registered": True, "id": row["id"], "name": name, "kind": kind, "bound_targets": tids}
+    result = {"registered": True, "id": row["id"], "name": name, "kind": kind,
+              "bound_targets": tids, "group_by": group_by}
     warn = await _glob_source_warn(source_glob)
     if warn:
         result["warning"] = warn
@@ -984,11 +1006,11 @@ async def _load_rule_owner(rule_id: int):
 async def update_alert(ctx: Context, rule_id: int, pattern: str = "", instructions: str = "",
                        source_glob: str = "", min_severity: int = -1, window_seconds: int = -1,
                        spike_lines: int = -1, cooldown_seconds: int = -1, rule_order: int = -1,
-                       stop_on_match_set: str = "", project_id: str = "") -> str:
+                       stop_on_match_set: str = "", project_id: str = "", group_by: str = "") -> str:
     """Edit an existing rule in place (owner or operator only). Only fields you pass change:
     strings change when non-empty; integers change when >= 0 (use -1 to leave unchanged);
     stop_on_match_set = 'true'/'false' to change it (empty = leave). The Ringdown prototype had no in-place edit —
-    this closes that gap."""
+    this closes that gap. group_by='host' (default) or 'rule' (all hosts); empty leaves it unchanged."""
     ident = _auth(ctx)
     if ident is None:
         return _err("unauthenticated: bearer failed validation")
@@ -1002,6 +1024,10 @@ async def update_alert(ctx: Context, rule_id: int, pattern: str = "", instructio
         await _audit(ident, "update_alert", {"rule_id": rule_id, "denied": "not owner"}, False)
         return _err(_deny_not_owner("rule", owner["created_by"]))
     sets, params = [], []
+    if group_by:
+        if group_by not in ("host", "rule"):
+            return _err("group_by must be 'host' or 'rule'.")
+        sets.append("group_by = %s"); params.append(group_by)
     if pattern:
         try:
             kind = (await _fetchone("SELECT kind FROM alert_rules WHERE id = %s", (int(rule_id),)))["kind"]
@@ -1101,7 +1127,7 @@ async def list_alerts(ctx: Context, include_disabled: bool = False, mine_only: b
     wsql = (" WHERE " + " AND ".join(where)) if where else ""
     rows = await _fetch(
         "SELECT id, name, kind, pattern, source_glob, min_severity, window_kind, window_seconds, "
-        "spike_lines, cooldown_seconds, rule_order, stop_on_match, enabled, project_id, last_fired, "
+        "spike_lines, cooldown_seconds, rule_order, stop_on_match, enabled, project_id, last_fired, group_by, "
         "created_by_upn, created_at FROM alert_rules" + wsql + " ORDER BY rule_order, id", params)
     binds = await _fetch("SELECT rule_id, target_id FROM rule_targets", [])
     tmap: dict = {}

@@ -162,7 +162,13 @@ async def test_turnstone_feed_reopens_when_ws_gone():
 @pytest.fixture
 def patch_db(monkeypatch):
     """Record DB writes; drive the incident lookup per test."""
-    state = {"incident": None, "executed": []}
+    state = {"incident": None, "executed": [], "enqueued": [], "queue_error": False}
+
+    async def fake_enqueue(self, ctx, target, *, dedup_source=None):
+        if state["queue_error"]:
+            raise RuntimeError("queue unavailable")
+        state["enqueued"].append((ctx, target, dedup_source))
+        return "queued"
 
     async def fake_fetchone(pool, sql, params=()):
         if "alert_incidents" in sql:
@@ -175,6 +181,7 @@ def patch_db(monkeypatch):
 
     monkeypatch.setattr(inc_mod.db, "fetchone", fake_fetchone)
     monkeypatch.setattr(inc_mod.db, "execute", fake_execute)
+    monkeypatch.setattr(inc_mod.AgentQueue, "enqueue", fake_enqueue)
     return state
 
 
@@ -191,15 +198,15 @@ def _reg(ntfy_http=None, ts_http=None, ts_ok=True):
     return reg
 
 
-async def test_coordinator_opens_fresh_incident(patch_db):
+async def test_coordinator_queues_fresh_incident(patch_db):
     ts_http = FakeHTTP()
     coord = Coordinator(None, _reg(ts_http=ts_http), fallback_ntfy_topic="fb")
     disp = await coord.handle(_ctx(owner="u-owner"), {"id": 5, "type": "turnstone", "config": {}})
-    assert disp == "opened"
-    assert any("workstreams/new" in c["url"] for c in ts_http.calls)
+    assert disp == "queued"
+    assert patch_db["enqueued"] and not ts_http.calls
 
 
-async def test_coordinator_feeds_open_incident_within_ttl(patch_db):
+async def test_coordinator_queues_repeats_for_scheduler(patch_db):
     patch_db["incident"] = {"dedup_key": "1:5:rtr-1", "status": "open", "handle": "ws-real",
                             "owner_user": "u-owner",
                             "last_event_at": datetime.now(timezone.utc),
@@ -207,11 +214,11 @@ async def test_coordinator_feeds_open_incident_within_ttl(patch_db):
     ts_http = FakeHTTP()
     coord = Coordinator(None, _reg(ts_http=ts_http), feed_interval=60, fallback_ntfy_topic="fb")
     disp = await coord.handle(_ctx(owner="u-owner"), {"id": 5, "type": "turnstone", "config": {}})
-    assert disp == "fed"
-    assert any("/send" in c["url"] for c in ts_http.calls)
+    assert disp == "queued"
+    assert patch_db["enqueued"] and not ts_http.calls
 
 
-async def test_coordinator_throttles_recent_feed(patch_db):
+async def test_coordinator_does_not_drop_recent_repeat(patch_db):
     patch_db["incident"] = {"dedup_key": "1:5:rtr-1", "status": "open", "handle": "ws-real",
                             "owner_user": "u-owner",
                             "last_event_at": datetime.now(timezone.utc),
@@ -219,29 +226,31 @@ async def test_coordinator_throttles_recent_feed(patch_db):
     ts_http = FakeHTTP()
     coord = Coordinator(None, _reg(ts_http=ts_http), feed_interval=60, fallback_ntfy_topic="fb")
     disp = await coord.handle(_ctx(owner="u-owner"), {"id": 5, "type": "turnstone", "config": {}})
-    assert disp == "throttled"
+    assert disp == "queued"
+    assert patch_db["enqueued"]
     assert not any("/send" in c["url"] for c in ts_http.calls)   # no send while throttled
 
 
-async def test_coordinator_falls_back_to_ntfy_on_dispatch_failure(patch_db):
+async def test_coordinator_falls_back_to_ntfy_on_enqueue_failure(patch_db):
     ntfy_http, ts_http = FakeHTTP(), FakeHTTP()
     reg = _reg(ntfy_http=ntfy_http, ts_http=ts_http, ts_ok=False)
     # make the turnstone create fail
     ts_http._resp = FakeResp(500)
+    patch_db["queue_error"] = True
     coord = Coordinator(None, reg, fallback_ntfy_topic="fb")
     disp = await coord.handle(_ctx(owner="u-owner"), {"id": 5, "type": "turnstone", "config": {}})
-    assert disp == "fallback"
+    assert disp == "error"
     assert ntfy_http.calls                                       # a human was paged, not left blind
 
 
-async def test_coordinator_rate_ceiling_suppresses_agent_open(patch_db):
+async def test_coordinator_rate_limit_defers_to_durable_scheduler(patch_db):
     ntfy_http, ts_http = FakeHTTP(), FakeHTTP()
     reg = _reg(ntfy_http=ntfy_http, ts_http=ts_http)
     coord = Coordinator(None, reg, rate_ceiling=0, fallback_ntfy_topic="fb")   # ceiling hit immediately
     disp = await coord.handle(_ctx(owner="u-owner"), {"id": 5, "type": "turnstone", "config": {}})
-    assert disp == "rate_limited"
+    assert disp == "queued"
     assert not any("workstreams/new" in c["url"] for c in ts_http.calls)       # no summon
-    assert ntfy_http.calls                                                     # but a push heads-up
+    assert not ntfy_http.calls  # normal queueing/backpressure is not another alert storm
 
 
 async def test_coordinator_unknown_type_falls_back(patch_db):

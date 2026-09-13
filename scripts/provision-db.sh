@@ -15,6 +15,7 @@ DB=${RINGDOWN_DB_NAME:-ringdown}
 ROLE=${RINGDOWN_DB_ROLE:-ringdown}
 HERE=$(cd "$(dirname "$0")" && pwd)
 SCHEMA="$HERE/../ringdown/schema.sql"
+AGENT_SCHEMA="$HERE/../ringdown/agent_schema.sql"
 ENV_OUT="$HERE/../.env"
 
 if [ -f "$ENV_OUT" ] && grep -q '^RINGDOWN_DB_DSN=' "$ENV_OUT"; then
@@ -48,7 +49,7 @@ fi
 psql -v ON_ERROR_STOP=1 -d "$DB" -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
 # Apply the schema as the owner role so all objects belong to ringdown.
-PGPASSWORD="$PW" psql -v ON_ERROR_STOP=1 -h "${RINGDOWN_DB_HOST:-localhost}" -U "$ROLE" -d "$DB" -f "$SCHEMA"
+PGPASSWORD="$PW" psql -v ON_ERROR_STOP=1 -1 -h "${RINGDOWN_DB_HOST:-localhost}" -U "$ROLE" -d "$DB" -f "$SCHEMA" -f "$AGENT_SCHEMA"
 echo "[*] schema applied"
 
 HOST_PUBLIC=${RINGDOWN_DB_PUBLIC_HOST:-localhost}

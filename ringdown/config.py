@@ -93,6 +93,9 @@ QUEUE_MAX = _i("RINGDOWN_QUEUE_MAX", 50_000)
 INCIDENT_REUSE_TTL = _f("RINGDOWN_INCIDENT_REUSE_TTL", 7200)   # reuse an open handle within this
 FEED_INTERVAL = _f("RINGDOWN_FEED_INTERVAL", 60)               # min gap between feeds to a handle
 GLOBAL_RATE_CEILING = _i("RINGDOWN_GLOBAL_RATE_CEILING", 120)  # max dispatches/min across all rules
+MAX_ACTIVE_WORKSTREAMS = _i("RINGDOWN_MAX_ACTIVE_WORKSTREAMS", 4)  # unclosed + reserved, globally
+DISPATCH_POLL_INTERVAL = _f("RINGDOWN_DISPATCH_POLL_INTERVAL", 10)
+DISPATCH_BATCH_SIZE = _i("RINGDOWN_DISPATCH_BATCH_SIZE", 20)
 
 # --- turnstone dispatcher (owner-OBO) ----------------------------------------
 TURNSTONE_URL = _s("RINGDOWN_TURNSTONE_URL", "http://127.0.0.1:8090").rstrip("/")

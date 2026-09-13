@@ -202,7 +202,11 @@ async def main() -> None:
     coordinator = Coordinator(pool, registry, reuse_ttl=config.INCIDENT_REUSE_TTL,
                               feed_interval=config.FEED_INTERVAL,
                               rate_ceiling=config.GLOBAL_RATE_CEILING,
-                              fallback_ntfy_topic=config.FALLBACK_NTFY_TOPIC)
+                              fallback_ntfy_topic=config.FALLBACK_NTFY_TOPIC,
+                              max_active=config.MAX_ACTIVE_WORKSTREAMS,
+                              poll_interval=config.DISPATCH_POLL_INTERVAL,
+                              batch_size=config.DISPATCH_BATCH_SIZE)
+    agent_dispatch = asyncio.create_task(coordinator.agents.run(stop))
     ruleset = Ruleset(pool)
     await ruleset.reload()
     ingress_filters = IngressFilterSet(pool)
@@ -312,6 +316,7 @@ async def main() -> None:
     if otlp_task:
         await otlp_task
     await router.drain()
+    await agent_dispatch
     await http.aclose()
     await pool.close()
 

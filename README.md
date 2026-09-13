@@ -98,7 +98,7 @@ the semantic judge, MCP search results, and the WebUI expose only a bounded
 allowlist of operational application and Netdata fields so arbitrary exporter data is
 not promoted into alerts or agent context.
 
-Re-apply `ringdown/schema.sql` before deploying a version that introduces schema changes:
+Apply all schemas before deploying a version that introduces schema changes:
 
 ```bash
 python -m ringdown.migrate
@@ -109,6 +109,16 @@ The schema is idempotent and applied transactionally; one-time data migrations a
 Historical filter purges use bounded batches and make deleted space reusable by PostgreSQL.
 Returning that space to the operating system still requires a separately scheduled partition
 rewrite or `VACUUM FULL`.
+
+## Incident grouping and workstream limits
+
+Agent incidents default to per-host grouping. Set an alert's `group_by="rule"`
+to collect a cross-host storm into one workstream per target/owner/project.
+Ringdown allows at most four unclosed incident workstreams, queues excess events
+durably, batches follow-ups, and recognizes closure in Turnstone automatically.
+The `dispatch_status` MCP tool reports capacity and pending-event counts.
+See [incident delivery](docs/incident-delivery.md) for configuration, failure
+semantics, migration, and rollback. No Turnstone changes are required.
 
 ## License
 

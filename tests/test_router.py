@@ -67,6 +67,17 @@ async def test_severity_floor_gates():
     assert got == []
 
 
+async def test_structured_otlp_attributes_are_matchable():
+    event = _event("provider state changed", source="example-app", sev=13)
+    event["attributes"] = {
+        "event": "example.provider.down",
+        "provider": "example-provider",
+        "err": {"stack": "not searchable"},
+    }
+    got = await _run([_rule(1, r"event=example\.provider\.down", [10])], event)
+    assert got == [(1, 10)]
+
+
 async def test_source_glob_gates():
     got = await _run([_rule(1, "flap", [10], glob="sw-*")], _event("flap", source="rtr-1"))
     assert got == []

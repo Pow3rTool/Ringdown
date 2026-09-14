@@ -26,6 +26,8 @@ class FireContext:
     safe_summary: str = ""           # public-safe one-liner — the ONLY thing safe for a public ntfy topic
     follow_up: str = ""              # terse "another match" line for feeds
     is_repeat: bool = False          # coordinator's open-vs-feed decision (informational)
+    request_id: str = ""             # durable caller-selected workstream id on create
+    delivery_id: str = ""            # batch correlation (not an exactly-once guarantee)
 
 
 @dataclass
@@ -56,3 +58,11 @@ class Dispatcher(abc.ABC):
     async def aclose(self) -> None:
         """Release resources (HTTP clients, etc.). Optional."""
         return None
+
+    async def prepare(self, ctx: FireContext, target: dict) -> FireContext:
+        """Resolve and freeze delivery identity before durable queueing."""
+        return ctx
+
+    async def inspect(self, ctx: FireContext, target: dict, handle: str) -> DispatchResult:
+        """Non-mutating lifecycle read. Unknown MUST NOT release an active slot."""
+        return DispatchResult(ok=False, handle=handle, detail="lifecycle inspection unavailable")

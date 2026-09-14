@@ -25,6 +25,7 @@ import time
 from collections import Counter, deque
 from datetime import datetime, timezone
 
+from .event_attrs import attribute_context, visible_attributes
 from . import config, db
 from .dispatch import FireContext
 from .syslog_parse import SEV_NUM
@@ -314,7 +315,7 @@ class SemanticJudge:
                 break
             self._note_call()
             evs = await db.fetch(self._pool,
-                "SELECT id, ts, source, severity, severity_text, program, body, template_id "
+                "SELECT id, ts, source, severity, severity_text, program, body, attributes, template_id "
                 "FROM events WHERE id > %s" + scope + " ORDER BY id ASC LIMIT 5000",
                 [last_id] + params)
             if not evs:
@@ -359,11 +360,14 @@ class SemanticJudge:
         span = f"{evs[0]['ts']:%H:%M:%S}–{evs[-1]['ts']:%H:%M:%S}Z"
         groups: dict = {}
         for e in evs:
-            key = (e.get("source"), e.get("program") or "?", e.get("template_id"))
+            attrs = visible_attributes(e.get("attributes"), string_limit=160)
+            context = attribute_context(attrs, max_chars=1000)
+            key = (e.get("source"), e.get("program") or "?", e.get("template_id"), context)
             g = groups.get(key)
             if g is None:
                 g = groups[key] = {"n": 0, "worst": -1, "sev": "?",
-                                   "src": e.get("source"), "prog": e.get("program") or "?", "bodies": []}
+                                   "src": e.get("source"), "prog": e.get("program") or "?",
+                                   "context": context, "bodies": []}
             g["n"] += 1
             sv = e.get("severity") or 0
             if sv > g["worst"]:
@@ -377,7 +381,8 @@ class SemanticJudge:
         for g in order[:50]:
             for i, b in enumerate(g["bodies"]):
                 pre = f"{g['n']}x " if i == 0 else "   "
-                lines.append(f"  {pre}{g['src']} [{g['sev']}] {g['prog']}: {b}")
+                suffix = f" [{g['context']}]" if g["context"] else ""
+                lines.append(f"  {pre}{g['src']} [{g['sev']}] {g['prog']}: {b}{suffix}")
         if len(order) > 50:
             lines.append(f"  ...(+{len(order) - 50} more lower-severity types omitted)")
         return "\n".join(lines)[:8000]

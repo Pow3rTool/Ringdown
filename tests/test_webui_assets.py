@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
-from ringdown.webui import _FAVICON_ASSETS, _FAVICON_DIR, _PAGE, build_app
+from ringdown.webui import _FAVICON_ASSETS, _FAVICON_DIR, _PAGE, _logitem, build_app
 
 
 def test_favicon_bundle_is_complete_and_routed():
@@ -28,3 +29,22 @@ def test_manifest_and_page_metadata_are_ringdown_specific():
             assert url in _PAGE or url in {
                 icon["src"] for icon in manifest["icons"]
             }
+
+
+def test_log_item_exposes_only_allowlisted_operator_attributes():
+    item = _logitem({
+        "ts": datetime(2026, 9, 8, tzinfo=timezone.utc),
+        "source": "example-app",
+        "severity": 13,
+        "severity_text": "WARN",
+        "program": "example-app",
+        "body": "request failed",
+        "attributes": {
+            "event": "example.request.failed", "requestId": 123, "provider": "example-provider",
+            "err": {"stack": "too much detail for the live feed"},
+            "resource": {"service.name": "example-app"},
+        },
+    })
+    assert item["attrs"] == {
+        "event": "example.request.failed", "requestId": 123, "provider": "example-provider",
+    }

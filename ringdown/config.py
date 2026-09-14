@@ -9,6 +9,7 @@ surprising partial state.
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 
@@ -75,6 +76,15 @@ RETENTION_INTERVAL = _f("RINGDOWN_RETENTION_INTERVAL", 86400)  # tick period (s)
 # --- collector / ingest ------------------------------------------------------
 SYSLOG_UDP = _s("RINGDOWN_SYSLOG_UDP", "0.0.0.0:514")
 SYSLOG_TCP = _s("RINGDOWN_SYSLOG_TCP", "0.0.0.0:514")
+OTLP_HTTP = _s("RINGDOWN_OTLP_HTTP", "0.0.0.0:4318")
+OTLP_ALLOWED_CIDRS = [
+    value.strip() for value in _s(
+        "RINGDOWN_OTLP_ALLOWED_CIDRS",
+        "127.0.0.0/8,::1/128",
+    ).split(",") if value.strip()
+]
+OTLP_MAX_BODY_BYTES = _i("RINGDOWN_OTLP_MAX_BODY_BYTES", 1_048_576)
+OTLP_MAX_RECORDS = _i("RINGDOWN_OTLP_MAX_RECORDS", 5000)
 BATCH_MAX = _i("RINGDOWN_BATCH_MAX", 500)
 BATCH_MS = _i("RINGDOWN_BATCH_MS", 1000)
 QUEUE_MAX = _i("RINGDOWN_QUEUE_MAX", 50_000)
@@ -83,6 +93,9 @@ QUEUE_MAX = _i("RINGDOWN_QUEUE_MAX", 50_000)
 INCIDENT_REUSE_TTL = _f("RINGDOWN_INCIDENT_REUSE_TTL", 7200)   # reuse an open handle within this
 FEED_INTERVAL = _f("RINGDOWN_FEED_INTERVAL", 60)               # min gap between feeds to a handle
 GLOBAL_RATE_CEILING = _i("RINGDOWN_GLOBAL_RATE_CEILING", 120)  # max dispatches/min across all rules
+MAX_ACTIVE_WORKSTREAMS = _i("RINGDOWN_MAX_ACTIVE_WORKSTREAMS", 4)  # unclosed + reserved, globally
+DISPATCH_POLL_INTERVAL = _f("RINGDOWN_DISPATCH_POLL_INTERVAL", 10)
+DISPATCH_BATCH_SIZE = _i("RINGDOWN_DISPATCH_BATCH_SIZE", 20)
 
 # --- turnstone dispatcher (owner-OBO) ----------------------------------------
 TURNSTONE_URL = _s("RINGDOWN_TURNSTONE_URL", "http://127.0.0.1:8090").rstrip("/")
@@ -227,6 +240,17 @@ def validate_collector() -> None:
     """Fail-closed gate for the collector (ingest + dispatch) process."""
     if not DB_DSN:
         raise SystemExit("RINGDOWN_DB_DSN is required (run scripts/provision-db.sh or set it in .env).")
+    if OTLP_HTTP:
+        if not OTLP_ALLOWED_CIDRS:
+            raise SystemExit("RINGDOWN_OTLP_ALLOWED_CIDRS must not be empty while OTLP is enabled.")
+        try:
+            for value in OTLP_ALLOWED_CIDRS:
+                ipaddress.ip_network(value, strict=False)
+        except ValueError as exc:
+            raise SystemExit(f"invalid RINGDOWN_OTLP_ALLOWED_CIDRS entry: {exc}") from exc
+        if OTLP_MAX_BODY_BYTES < 1 or OTLP_MAX_RECORDS < 1:
+            raise SystemExit(
+                "RINGDOWN_OTLP_MAX_BODY_BYTES and RINGDOWN_OTLP_MAX_RECORDS must be positive.")
     # A dispatch path must be reachable, else a fired hook is silently lost.
     turnstone_on = bool(TURNSTONE_ADMIN_TOKEN)
     ntfy_on = bool(NTFY_URL and NTFY_TOKEN)

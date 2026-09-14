@@ -123,7 +123,7 @@ async def flusher(q, stop, router: Router, ingress_filters: IngressFilterSet):
             received = []
             try:
                 first = await asyncio.wait_for(q.get(), timeout=0.5)
-                received.append(parse_syslog(*first))
+                received.append(first if isinstance(first, dict) else parse_syslog(*first))
             except asyncio.TimeoutError:
                 continue
             deadline = loop.time() + config.BATCH_MS / 1000
@@ -133,7 +133,7 @@ async def flusher(q, stop, router: Router, ingress_filters: IngressFilterSet):
                     break
                 try:
                     item = await asyncio.wait_for(q.get(), timeout=remaining)
-                    received.append(parse_syslog(*item))
+                    received.append(item if isinstance(item, dict) else parse_syslog(*item))
                 except asyncio.TimeoutError:
                     break
             batch, dropped = ingress_filters.partition(received)
@@ -202,7 +202,11 @@ async def main() -> None:
     coordinator = Coordinator(pool, registry, reuse_ttl=config.INCIDENT_REUSE_TTL,
                               feed_interval=config.FEED_INTERVAL,
                               rate_ceiling=config.GLOBAL_RATE_CEILING,
-                              fallback_ntfy_topic=config.FALLBACK_NTFY_TOPIC)
+                              fallback_ntfy_topic=config.FALLBACK_NTFY_TOPIC,
+                              max_active=config.MAX_ACTIVE_WORKSTREAMS,
+                              poll_interval=config.DISPATCH_POLL_INTERVAL,
+                              batch_size=config.DISPATCH_BATCH_SIZE)
+    agent_dispatch = asyncio.create_task(coordinator.agents.run(stop))
     ruleset = Ruleset(pool)
     await ruleset.reload()
     ingress_filters = IngressFilterSet(pool)
@@ -225,6 +229,38 @@ async def main() -> None:
         srv = await asyncio.start_server(lambda r, w: _tcp_client(r, w, q), host, port)
         servers.append(srv)
         print(f"[tcp] listening on {host}:{port}", flush=True)
+    otlp_server = otlp_task = None
+    if config.OTLP_HTTP:
+        import uvicorn
+        from .otlp import create_otlp_app
+
+        host, port = _hostport(config.OTLP_HTTP)
+
+        class _EmbeddedServer(uvicorn.Server):
+            def install_signal_handlers(self):
+                return None
+
+        otlp_server = _EmbeddedServer(uvicorn.Config(
+            create_otlp_app(
+                q,
+                config.OTLP_ALLOWED_CIDRS,
+                config.OTLP_MAX_BODY_BYTES,
+                config.OTLP_MAX_RECORDS,
+            ),
+            host=host,
+            port=port,
+            access_log=False,
+            log_level="warning",
+        ))
+        otlp_task = asyncio.create_task(otlp_server.serve())
+        await asyncio.sleep(0)
+        if otlp_task.done():
+            await otlp_task
+        print(
+            f"[otlp] HTTP/JSON listening on {host}:{port}/v1/logs; "
+            f"trusted={','.join(config.OTLP_ALLOWED_CIDRS)}",
+            flush=True,
+        )
 
     # live rule propagation: refresh the ruleset on Postgres NOTIFY (debounced)
     async def _on_notify(_payload: str):
@@ -270,12 +306,17 @@ async def main() -> None:
         tr.close()
     for srv in servers:
         srv.close()
+    if otlp_server:
+        otlp_server.should_exit = True
     await fl
     await mt
     await asyncio.gather(rule_listener, filter_listener)
     if sem:
         await sem
+    if otlp_task:
+        await otlp_task
     await router.drain()
+    await agent_dispatch
     await http.aclose()
     await pool.close()
 

@@ -28,7 +28,7 @@ class Ruleset:
         """Rebuild the compiled L1 ruleset + target bindings from the DB."""
         rows = await db.fetch(self._pool,
             "SELECT id, name, pattern, instructions, source_glob, min_severity, rule_order, "
-            "stop_on_match, owner_user, project_id, created_by, created_by_upn "
+            "stop_on_match, owner_user, project_id, created_by, created_by_upn, group_by "
             "FROM alert_rules WHERE enabled AND kind = 'regex' ORDER BY rule_order, id")
         # target bindings for all rules in one query
         binds = await db.fetch(self._pool,
@@ -64,5 +64,6 @@ class Ruleset:
                 "stop_on_match": r["stop_on_match"], "owner_user": r["owner_user"],
                 "project_id": r["project_id"], "created_by": r["created_by"],
                 "created_by_upn": r["created_by_upn"], "targets": targets,
+                "group_by": r.get("group_by", "host"),
             })
         self._rules = compiled
